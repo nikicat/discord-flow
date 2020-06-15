@@ -15,8 +15,8 @@ pydub = "*"
 dialogflow = "*"
 google-search-api = "*"
 google-search-results = "*"
-gtts = "*"
 "discord.py" = {git = "https://github.com/imayhaveborkedit/discord.py"}
+google-cloud-texttospeech = "*"
 
 [requires]
 python_version = "3.8"

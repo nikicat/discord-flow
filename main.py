@@ -5,14 +5,17 @@ import audioop
 import wave
 from enum import Enum, auto
 from struct import Struct
+from threading import Thread
+from queue import Queue
 
 import dialogflow_v2.types
+import requests
 
 from discord.ext import commands
 from discord.opus import Decoder, Encoder, _load_default
 from discord.reader import AudioSink
 from discord.player import AudioSource
-from gtts import gTTS
+from google.cloud import texttospeech
 from pvporcupine import create
 from pydub import AudioSegment
 from serpapi.google_search_results import GoogleSearchResults
@@ -25,43 +28,42 @@ class State(Enum):
     WaitingWuw = auto()
     WaitingQuestion = auto()
     ListeningQuestion = auto()
+    Answering = auto()
 
 
-class PorcupineSink(AudioSink, AudioSource):
-    def __init__(self, voice_client, keywords):
-        self.pcp = create(keywords=keywords)
+class PorcupineSink:
+    def __init__(self, parent, keywords):
+        self.parent = parent
+        self.what = parent.what
+        self.that = parent.that
+        self.pcp = create(keywords=keywords, sensitivities=[0.5] * len(keywords))
         self.audio_state = None
         self.input = b''
         self.raw_input = b''
         self.to_skip = 0
         self.unpacker = Struct(f'{self.pcp.frame_length}h')
-        self.output = b''
-        self.what = wave.open('what2.wav', 'rb').readframes(100000)
-        self.that = wave.open('that2.wav', 'rb').readframes(100000)
         self.state = State.WaitingWuw
-        self.play(self.what)
-        self.play(self.that)
-        self.deleted = False
+        self.voice = texttospeech.VoiceSelectionParams(
+            language_code='ru_RU', ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
+        )
 
         self.dialogflow_client = dialogflow_v2.SessionsClient()
         self.dialogflow_project_id = 'agent-322-kolya-hosjfw'
-
-        voice_client.listen(self)
-        voice_client.play(self, after=lambda e: print('Player error: %s' % e) if e else None)
+        self.tasks = Queue()
+        self.back_thread = Thread(target=self.back_loop)
+        self.back_thread.daemon = True
+        self.back_thread.start()
 
         logger.debug('Started Porcupine sink')
 
-    def read(self):
-        result = b''
-        if self.output:
-            result += self.output[:Encoder.FRAME_SIZE]
-            self.output = self.output[Encoder.FRAME_SIZE:]
-        if len(result) < Encoder.FRAME_SIZE:
-            result += b'\x00' * (Encoder.FRAME_SIZE - len(result))
-        return result
+    def back_loop(self):
+        while True:
+            data, user = self.tasks.get()
+            self.detect_intent(data, user)
+            self.tasks.task_done()
 
-    def play(self, data: bytes):
-        self.output += data
+    def play(self, data):
+        self.parent.play(data)
 
     def write(self, data):
         width = Decoder.SAMPLE_SIZE // Decoder.CHANNELS
@@ -85,13 +87,13 @@ class PorcupineSink(AudioSink, AudioSource):
                 data=self.raw_input[len(self.raw_input) - silence_length_bytes:],
                 sample_width=width, frame_rate=Decoder.SAMPLING_RATE, channels=Decoder.CHANNELS,
             ).rms
-            logger.debug(f'last second rms: {rms}')
             if rms == 0:
                 logger.debug('Detected silence')
                 self.play(self.that)
                 mono = audioop.tomono(self.raw_input, width, 0.5, 0.5)
                 self.raw_input = b''
-                self.detect_intent(mono, data.user)
+                self.tasks.put((mono, data.user))
+                self.state = State.Answering
         elif self.state is State.WaitingWuw:
             mono = audioop.tomono(data.data, width, 0.5, 0.5)
             converted, self.audio_state = audioop.ratecv(
@@ -102,14 +104,15 @@ class PorcupineSink(AudioSink, AudioSource):
                 to_process = self.input[:self.pcp.frame_length * width]
                 self.input = self.input[self.pcp.frame_length * width:]
                 result = self.pcp.process(self.unpacker.unpack(to_process))
-                if result:
-                    logger.debug('Detected keyword')
+                if result >= 0:
+                    logger.debug(f'Detected keyword {result}')
                     self.play(self.what)
                     self.state = State.WaitingQuestion
                     self.to_skip = len(self.what)
                     self.input = b''
-                else:
-                    logger.debug(f'last frame rms: {rms}')
+        elif self.state is State.Answering:
+            pass
+        #logger.debug(f'{data.user} {self.state} {rms}')
 
     def detect_intent(self, data, user):
         session = self.dialogflow_client.session_path(self.dialogflow_project_id, user)
@@ -135,13 +138,29 @@ class PorcupineSink(AudioSink, AudioSource):
             self.play(mono_answer)
         else:
             answer = b''
-        if response.query_result.action == 'google.search':
-            self.google_search(response.query_result.parameters.fields['query'].string_value)
+        action = response.query_result.action
+        parameters = response.query_result.parameters.fields
+        query = parameters['query'].string_value if 'query' in parameters else response.query_result.query_text
+        if action == 'google.search':
+            answer = self.google_search(query)
+        elif action == 'google.news':
+            answer = self.google_news(parameters['subject'].string_value)
+        elif action == 'format':
+            answer = response.query_result.filfillment_text.format(query=query)
+        elif action == 'pbot':
+            answer = self.query_pbot(query)
+        else:
+            answer = None
+        if answer:
+            self.play(self.text_to_speech(answer))
+            self.state = State.WaitingWuw
         if response.query_result.all_required_params_present:
             self.state = State.WaitingWuw
-        else:
+        elif response.query_result.query_text:
             self.state = State.WaitingQuestion
             self.to_skip = len(answer)
+        else:
+            self.state = State.WaitingWuw
 
         response.output_audio = b''
         print(response)
@@ -159,31 +178,122 @@ class PorcupineSink(AudioSink, AudioSource):
 
         client = GoogleSearchResults(params)
         results = client.get_dict()
+        answer = None
         logger.debug(f'serp results: {results}')
         if 'knowledge_graph' in results:
-            answer = results['knowledge_graph']['description']
-            self.play(self.text_to_speech(answer))
-        else:
-            self.play(self.text_to_speech("что-то я не нашла"))
-        self.state = State.WaitingWuw
+            knowledge_graph = results['knowledge_graph']
+            if 'description' in knowledge_graph:
+                answer = knowledge_graph['description']
+                logger.debug(f'knowledge graph: {answer}')
+        if answer is None and 'answer_box' in results:
+            answer_box = results['answer_box']
+            if 'result' in answer_box:
+                answer = answer_box['result']
+                logger.debug(f'answer box result: {answer}')
+            elif 'snippet' in answer_box:
+                answer = answer_box['snippet']
+                logger.debug(f'answer box snippet: {answer}')
+        if answer is None and results.get('organic_results'):
+            answer = results['organic_results'][0].get('snippet')
+        return answer or "что-то я не нашла"
+
+    def google_news(self, subject):
+        params = dict(
+            tbm='nws',
+            q=subject,
+            api_key=os.getenv('SERPAPI_KEY'),
+            gl='ru',
+            hl='ru',
+        )
+
+        client = GoogleSearchResults(params)
+        results = client.get_dict()
+        logger.debug(f'news results: {results}')
+        answer = results.get('news_results',  [{}])[0].get('snippet')
+        return answer or "что-то я не нашла"
+
+    def query_pbot(self, query):
+        data = dict(
+            request=query,
+            dialog_lang='ru',
+            dialog_greeting=False,
+            a='public-api',
+            b=2344965608,
+            c='3583983984',
+            d='3846106130',
+            e='0.3083590588085976',
+            t='1592231233017',
+            x='3.795646366191572',
+        )
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+        }
+        url = 'http://p-bot.ru/api/getAnswer'
+        response = requests.post(url, data=data, headers=headers)
+        if response.status_code != 200:
+            logger.debug(f'pBot response: {response}: {response.text}')
+            return "что-то ничего в голову не приходит"
+        return response.json()['answer']
 
     def text_to_speech(self, text):
-        data = io.BytesIO()
-        gTTS(text, lang='ru').write_to_fp(data)
-        data.seek(0)
-        segment = AudioSegment.from_mp3(data)
-        logger.debug(f'TTS result: {segment.sample_width}, {segment.channels}, {segment.frame_rate}')
+        client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.LINEAR16)
+        response = client.synthesize_speech(input=synthesis_input, voice=self.voice, audio_config=audio_config)
+        data = io.BytesIO(response.audio_content)
+        audio = wave.open(data, 'rb')
         converted, _ = audioop.ratecv(
-            segment.raw_data, segment.sample_width, segment.channels, segment.frame_rate, Encoder.SAMPLING_RATE, None,
+            audio.readframes(9999999), audio.getsampwidth(), audio.getnchannels(), audio.getframerate(), Encoder.SAMPLING_RATE,
+            None,
         )
-        return audioop.tostereo(converted, segment.sample_width, 1, 1)
+        return audioop.tostereo(converted, audio.getsampwidth(), 1, 1)
+
+    def close(self):
+        self.pcp.delete()
+
+
+class DemultiplexerSink(AudioSink, AudioSource):
+    def __init__(self, voice_client, keywords):
+        self.keywords = keywords
+        self.users = {}
+        self.output = b''
+        self.deleted = False
+        self.what = wave.open('what2.wav', 'rb').readframes(100000)
+        self.that = wave.open('that2.wav', 'rb').readframes(100000)
+        self.play(self.what)
+        self.play(self.that)
+
+        voice_client.listen(self)
+        voice_client.play(self, after=lambda e: print('Player error: %s' % e) if e else None)
+
+        logger.debug('Started Porcupine sink')
+
+    def write(self, data):
+        if data.user in self.users:
+            usersink = self.users[data.user]
+        else:
+            self.users[data.user] = usersink = PorcupineSink(self, self.keywords)
+        usersink.write(data)
+
+    def read(self):
+        result = b''
+        if self.output:
+            result += self.output[:Encoder.FRAME_SIZE]
+            self.output = self.output[Encoder.FRAME_SIZE:]
+        if len(result) < Encoder.FRAME_SIZE:
+            result += b'\x00' * (Encoder.FRAME_SIZE - len(result))
+        return result
+
+    def play(self, data: bytes):
+        self.output += data
 
     def cleanup(self):
         if self.deleted:
             return
         self.deleted = True
         logger.debug('Deleting Porcupine')
-        self.pcp.delete()
+        for usersink in self.users.values():
+            usersink.close()
 
 
 class DialogflowCog(commands.Cog):
@@ -206,7 +316,7 @@ class DialogflowCog(commands.Cog):
 
     @commands.command()
     async def listen(self, ctx, keyword: str):
-        PorcupineSink(ctx.voice_client, keywords=[keyword])
+        DemultiplexerSink(ctx.voice_client, keywords=[keyword])
 
     @join.before_invoke
     @listen.before_invoke
@@ -233,7 +343,22 @@ async def on_ready():
     _load_default()
     channel = bot.get_channel(653229977545998350)
     voice_client = await channel.connect()
-    PorcupineSink(voice_client, ['computer'])
+    DemultiplexerSink(voice_client, [
+        'view glass',
+        'grasshopper',
+        'blueberry',
+        'jarvis',
+        'bumblebee',
+        'porcupine',
+        'picovoice',
+        'snowboy',
+        'grapefruit',
+        'smart mirror',
+        'alexa',
+        'americano',
+        'computer',
+        'terminator',
+    ])
 
 bot.add_cog(DialogflowCog(bot))
 bot.run(os.getenv('TOKEN'))
