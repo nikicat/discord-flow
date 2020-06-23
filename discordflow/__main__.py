@@ -2,60 +2,32 @@ import asyncio
 import audioop
 import io
 import logging
+import logging.handlers
 import os
+import importlib
+import random
+import re
 import time
-import wave
 from contextlib import suppress
-from functools import partial
-from itertools import count
+from copy import deepcopy
+from itertools import count, groupby
 from struct import Struct
 
-import dialogflow_v2.types
+import pkg_resources
+importlib.reload(pkg_resources)  # HACK: https://github.com/googleapis/google-api-python-client/issues/476#issuecomment-371797043
+
 from discord.ext import commands
 from discord.opus import Decoder, Encoder, _load_default
 from discord.reader import AudioSink
-from google.cloud import texttospeech
 from pvporcupine import create
 from serpapi.google_search_results import GoogleSearchResults
 
+from .utils import sync_to_async, load_sound, BackgroundTask, Interrupted, SAMPLE_WIDTH
+from .yandex import text_to_speech, speech_to_text
+from .google import detect_intent
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-
-
-SAMPLE_WIDTH = Decoder.SAMPLE_SIZE // Decoder.CHANNELS
-
-
-class Interrupted(Exception):
-    pass
-
-
-class BackgroundTask:
-    def __init__(self):
-        self.task = None
-
-    def start(self, coro):
-        if self.task is not None:
-            raise RuntimeError("{self!r} is already running")
-        self.task = asyncio.create_task(coro)
-
-    async def stop(self):
-        self.task.cancel()
-        with suppress(asyncio.CancelledError):
-            await self.task
-        self.task = None
-
-
-class Waiter(BackgroundTask):
-    def set(self, delay, callback):
-        self.start(self.wait(delay, callback))
-
-    async def wait(self, delay, callback):
-        await asyncio.sleep(delay)
-        await callback()
-
-
-async def sync_to_async(func, *args, **kwargs):
-    return await asyncio.get_running_loop().run_in_executor(None, partial(func, *args, **kwargs))
 
 
 class PorcupineSink:
@@ -67,13 +39,8 @@ class PorcupineSink:
         self.input = b''
         self.question_input = b''
         self.unpacker = Struct(f'{self.pcp.frame_length}h')
-        self.voice = texttospeech.VoiceSelectionParams(
-            language_code='ru_RU', ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
-        )
         self.input_queue = asyncio.Queue()
 
-        self.dialogflow_client = dialogflow_v2.SessionsClient()
-        self.dialogflow_project_id = 'agent-322-kolya-hosjfw'
         self.background_player = BackgroundTask()
         self.skill_task = BackgroundTask()
 
@@ -128,14 +95,20 @@ class PorcupineSink:
                     logger.debug(f'Detected keyword "{keyword}"')
                     return keyword
 
-    async def listen_utterance(self):
-        logger.debug("Listening utterance")
+    async def listen_utterance(self, timeout=2.3):
+        logger.debug(f"Listening utterance with timeout {timeout}")
         self.background_player.start(self.play_loop(self.ticktock))
         sound = b''
+        speech_started = False
         while True:
             try:
-                sound += await asyncio.wait_for(self.listen(), timeout=0.4)
+                actual_timeout = 0.4 if speech_started else timeout
+                sound += await asyncio.wait_for(self.listen(), timeout=actual_timeout)
+                # FIXME
+                if len(sound) > 50000:
+                    speech_started = True
             except asyncio.TimeoutError:
+                logger.debug("Stop listening utterance due a timeout")
                 await self.background_player.stop()
                 return sound
 
@@ -144,10 +117,10 @@ class PorcupineSink:
 
     def write(self, data):
         self.input_queue.put_nowait(data.pcm)
-        logger.debug(f'write: {data.user}. qsize={self.input_queue.qsize()}')
+        logger.log(5, f'write: {data.user}. qsize={self.input_queue.qsize()}')
         return
 
-    async def play_answer(self, answer):
+    async def play_interruptible(self, answer):
         logger.debug("Playing answer")
         wait_for_wuw = self.wait_for_wuw()
         play = self.play(answer)
@@ -160,35 +133,18 @@ class PorcupineSink:
             logger.debug("Interrupting")
             raise Interrupted
 
-    async def process_utterance(self, utterance):
-        session = self.dialogflow_client.session_path(self.dialogflow_project_id, self.user)
-        logger.debug(f"Session: {session}")
-        query_input = dialogflow_v2.types.QueryInput(audio_config=dialogflow_v2.types.InputAudioConfig(
-            audio_encoding=self.dialogflow_client.enums.AudioEncoding.AUDIO_ENCODING_LINEAR_16,
-            sample_rate_hertz=Decoder.SAMPLING_RATE,
-            language_code='ru',
-            enable_word_info=True,
-        ))
-
-        response = await sync_to_async(
-            self.dialogflow_client.detect_intent,
-            session=session,
-            query_input=query_input,
-            output_audio_config=dialogflow_v2.types.OutputAudioConfig(
-                audio_encoding=self.dialogflow_client.enums.AudioEncoding.AUDIO_ENCODING_LINEAR_16,
-                sample_rate_hertz=Encoder.SAMPLING_RATE,
-            ),
-            input_audio=audioop.tomono(utterance, SAMPLE_WIDTH, 0.5, 0.5),
-        )
+    async def process_utterance(self, utterance: bytes):
+        text = await speech_to_text(utterance)
+        response = await detect_intent(text, self.user)
         output_audio = response.output_audio
         response.output_audio = b''
-        logger.debug(f"Response: {response}")
+        logger.log(5, f"Response: {response}")
         logger.debug(f"Query: {response.query_result.query_text}")
         logger.debug(f"Fulfillment: {response.query_result.fulfillment_text}")
         if output_audio:
-            answer = wave.open(io.BytesIO(output_audio), 'rb').readframes(999999999)
+            answer = load_sound(io.BytesIO(output_audio))
             mono_answer = audioop.tostereo(answer, 2, 1, 1)
-            await self.play_answer(mono_answer)
+            await self.play_interruptible(mono_answer)
         action = response.query_result.action
         parameters = response.query_result.parameters.fields
         query = parameters['query'].string_value if 'query' in parameters else response.query_result.query_text
@@ -197,10 +153,10 @@ class PorcupineSink:
             await self.process_utterance(user_answer)
         elif action == 'google.search':
             answer = await self.google_search(query)
-            await self.play_answer(await self.text_to_speech(answer))
+            await self.play_interruptible(await text_to_speech(text=answer))
         elif action == 'format':
             answer = response.query_result.filfillment_text.format(query=query)
-            await self.play_answer(answer)
+            await self.play_interruptible(answer)
         elif action == 'skill':
             skill = parameters['skill'].string_value
             params = {p: parameters[p].string_value for p in parameters}
@@ -208,9 +164,11 @@ class PorcupineSink:
         elif action is None and response.output_audio is None:
             logger.debug("Empty response")
 
-    async def ask_question(self, question):
-        await self.play_answer(await self.text_to_speech(question))
-        return await self.listen_utterance()
+    async def ask(self, question, timeout=4):
+        request = await text_to_speech(text=question)
+        await self.play_interruptible(request)
+        reply = await self.listen_utterance(timeout=timeout)
+        return await speech_to_text(reply)
 
     async def google_search(self, query):
         params = dict(
@@ -243,34 +201,16 @@ class PorcupineSink:
         return answer or "что-то я не нашла"
 
     async def speak(self, text):
-        audio = await self.text_to_speech(text)
-        await self.play_answer(audio)
+        logger.debug(f"Speaking: {text}")
+        audio = await text_to_speech(text=text)
+        await self.play_interruptible(audio)
 
     def ddg_search(self, query):
         pass
 
-    async def text_to_speech(self, text):
-        client = texttospeech.TextToSpeechClient()
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-        audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.LINEAR16)
-        response = await sync_to_async(
-            client.synthesize_speech, input=synthesis_input, voice=self.voice, audio_config=audio_config,
-        )
-        data = io.BytesIO(response.audio_content)
-        audio = wave.open(data, 'rb')
-        converted, _ = audioop.ratecv(
-            audio.readframes(9999999), audio.getsampwidth(), audio.getnchannels(), audio.getframerate(), Encoder.SAMPLING_RATE,
-            None,
-        )
-        return audioop.tostereo(converted, audio.getsampwidth(), 1, 1)
-
     async def close(self):
         await self.listen_task.stop()
         self.pcp.delete()
-
-
-def load_sound(filename):
-    return wave.open(filename, 'rb').readframes(100000)
 
 
 class DemultiplexerSink(AudioSink):
@@ -336,7 +276,7 @@ class DemultiplexerSink(AudioSink):
 class DialogflowCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(level=logging.INFO)
         logging.getLogger('discord.gateway').setLevel(logging.ERROR)
 
     @commands.command()
@@ -399,13 +339,70 @@ async def dfrotz_skill(bot, parameters):
     await bot.speak("стартую скиллуху")
 
 
+def get_next_letter(city):
+    return re.sub('[ьъ]', '', city)[-1]
+
+
+@registry.skill('cities')
+async def cities_skill(bot, parameters):
+    cities = {
+        first_letter: list(cities)
+        for first_letter, cities in groupby(
+            sorted([line.split(';')[-1][1:-1].lower() for line in open('city_.csv').read().split('\n')[1:]]),
+            key=lambda city: city and city[0],
+        )
+    }
+    orig_cities = deepcopy(cities)
+    seen_cities = set()
+    user_city = await bot.ask("Давай! Называй город!", timeout=5)
+    bot_city = None
+    while True:
+        user_city = user_city.lower()
+        if user_city == "повтори":
+            user_city = await bot.ask(bot_city, timeout=5)
+            continue
+        user_letter = user_city[0]
+        if user_city not in orig_cities[user_letter]:
+            await bot.speak("Такого города нет, ты проиграл ха-ха-ха")
+        elif bot_city and user_letter != (expected_user_letter := get_next_letter(bot_city)):
+            await bot.speak(f"Неправильно, ты должен был назвать город на букву {expected_user_letter}. Ты проиграл, ха-ха-ха!")
+        elif user_city in seen_cities:
+            await bot.speak("Этот город уже называли, ты проиграл, ха-ха-ха!")
+        else:
+            seen_cities.add(user_city)
+            cities[user_letter].remove(user_city)
+            bot_letter = get_next_letter(user_city)
+            bot_city = random.choice(cities[bot_letter])
+            seen_cities.add(bot_city)
+            cities[bot_letter].remove(bot_city)
+            logger.debug(f"Bot city: {bot_city}")
+            user_city = await bot.ask(bot_city, timeout=5)
+            continue
+        break
+
+
+class DiscordHandler(logging.Handler):
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel
+        self.loop = asyncio.get_running_loop()
+
+    async def send_message(self, message):
+        await self.channel.send(f'```{message}```')
+
+    def emit(self, record):
+        asyncio.run_coroutine_threadsafe(self.send_message(self.format(record)), self.loop)
+
+
 @bot.event
 async def on_ready():
     print('Logged in as {0} ({0.id})'.format(bot.user))
     print('------')
     _load_default()
-    channel = bot.get_channel(653229977545998350)
-    voice_client = await channel.connect()
+    handler = DiscordHandler(bot.get_channel(653229977545998349))
+    logger.addHandler(handler)
+    voice_channel = bot.get_channel(653229977545998350)
+    voice_client = await voice_channel.connect()
     sink = DemultiplexerSink(voice_client, [
         'view glass',
         'grasshopper',
@@ -424,5 +421,11 @@ async def on_ready():
     ])
     await sink.play(sink.hello)
 
-bot.add_cog(DialogflowCog(bot))
-bot.run(os.getenv('TOKEN'))
+
+def main():
+    bot.add_cog(DialogflowCog(bot))
+    bot.run(os.getenv('TOKEN'))
+
+
+if __name__ == '__main__':
+    main()
