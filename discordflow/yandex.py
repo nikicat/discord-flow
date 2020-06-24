@@ -11,16 +11,29 @@ logger = logging.getLogger(__name__)
 
 async def request_yandex(url: str, **kwargs):
     api_key = os.getenv('YANDEX_API_KEY')
-    async with aiohttp.ClientSession(raise_for_status=True) as session:
-        async with session.post(url, **kwargs, headers=dict(Authorization=f'Api-Key {api_key}')) as response:
-            return await response.read()
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(url, **kwargs, headers=dict(Authorization=f'Api-Key {api_key}')) as response:
+                body = await response.read()
+                response.raise_for_status()
+                return body
+        except aiohttp.client_exceptions.ClientResponseError as exc:
+            breakpoint()
+            raise
 
 
-async def text_to_speech(**data) -> Audio:
+async def text_to_speech(text=None, ssml=None) -> Audio:
+    logger.info(f"TTS: {text or ssml}")
     rate = 48000
+    if text == ssml:
+        raise ValueError("One and Only one of (text, ssml) must be set")
+    elif text:
+        kwargs = dict(text=text)
+    elif ssml:
+        kwargs = dict(ssml=ssml)
     data = await request_yandex(
         'https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize',
-        data=dict(format='lpcm', sampleRateHertz=rate, **data),
+        data=dict(format='lpcm', sampleRateHertz=rate, **kwargs),
     )
     return Audio(data=data, channels=1, rate=rate, width=2)
 
@@ -32,5 +45,5 @@ async def speech_to_text(speech: Audio):
         data=speech.to_mono().data,
     )
     result = json.loads(response)['result']
-    logger.info(f"STT: {result}", extra=dict(speech=speech))
+    logger.info(f"STT: {speech} -> {result}", extra=dict(speech=speech))
     return result

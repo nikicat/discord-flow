@@ -83,8 +83,8 @@ async def detect_intent(utterance: str, session_id: str) -> Intent:
         **kwargs,
     )
     return Intent(
-        text=response.query_result.filfillment_text,
-        parameters={field.name: field.string_value for field in response.query_result.parameters.fields},
+        text=response.query_result.fulfillment_text,
+        parameters={field_name: field.string_value for field_name, field in response.query_result.parameters.fields.items()},
         action=response.query_result.action,
         all_required_params_present=response.query_result.all_required_params_present,
     )

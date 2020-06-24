@@ -1,15 +1,23 @@
 import asyncio
 import audioop
 import io
+import logging
+import pickle
 import wave
-from contextlib import suppress
+from contextlib import suppress, asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 
 import simpleaudio
 
+logger = logging.getLogger(__name__)
+
 
 class Interrupted(Exception):
+    pass
+
+
+class EmptyUtterance(Exception):
     pass
 
 
@@ -27,6 +35,16 @@ class BackgroundTask:
         with suppress(asyncio.CancelledError):
             await self.task
         self.task = None
+
+
+@asynccontextmanager
+async def background_task(coro):
+    try:
+        task = BackgroundTask()
+        task.start(coro)
+        yield
+    finally:
+        await task.stop()
 
 
 class Waiter(BackgroundTask):
@@ -50,7 +68,8 @@ class Audio:
     data: bytes = b''
 
     def __str__(self):
-        return f'channels={self.channels} width={self.width}B rate={self.rate}Hz frames={len(self)}'
+        duration = round(self.duration, 3)
+        return f'channels={self.channels} width={self.width} rate={self.rate}Hz frames={len(self)} duration={duration}s'
 
     def __repr__(self):
         return f'{type(self)}[{self}]'
@@ -58,27 +77,41 @@ class Audio:
     def __add__(self, other):
         if other.channels != self.channels or other.width != self.width or other.rate != self.rate:
             raise ValueError("Could not add incompatible Audio")
-        return Audio(channels=self.channels, width=self.width, rate=self.rate, data=self.data + other.data)
+        return self.clone(self.data + other.data)
+
+    def __mul__(self, factor):
+        return self.clone(audioop.mul(self.data, self.width, factor))
+
+    def combine(self, other):
+        return self.clone(data=audioop.add(self.data, other.data, self.width))
+
+    def clone(self, data):
+        """Return clone with different data"""
+        return Audio(width=self.width, channels=self.channels, rate=self.rate, data=data)
 
     def __getitem__(self, slice):
         """Slice frames"""
         start = slice.start and slice.start * self.framewidth
         stop = slice.stop and slice.stop * self.framewidth
         step = slice.step and slice.step * self.framewidth
-        return Audio(channels=self.channels, width=self.width, rate=self.rate, data=self.data[start:stop:step])
+        return self.clone(self.data[start:stop:step])
 
-    def __len__(self):
+    def __len__(self) -> int:
         """Audio length in frames"""
         return len(self.data) // self.framewidth
 
     @property
-    def duration(self):
+    def duration(self) -> float:
         """Duration in seconds"""
         return len(self) / self.rate
 
     @property
-    def framewidth(self):
+    def framewidth(self) -> int:
         return self.channels * self.width
+
+    @property
+    def rms(self) -> float:
+        return audioop.rms(self.data, self.width)
 
     def clear(self):
         self.data = b''
@@ -99,7 +132,7 @@ class Audio:
         else:
             raise ValueError(f"Can't convert audio with channels={self.channels}")
 
-    def to_rate(self, rate):
+    def to_rate(self, rate) -> 'Audio':
         converted, _ = audioop.ratecv(self.data, self.width, self.channels, self.rate, rate, None)
         return Audio(channels=self.channels, width=self.width, rate=rate, data=converted)
 
@@ -114,10 +147,10 @@ class Audio:
             )
 
     @classmethod
-    def from_wav(cls, wav: bytes):
+    def from_wav(cls, wav: bytes) -> 'Audio':
         return cls.load(io.BytesIO(wav))
 
-    def to_wav(self):
+    def to_wav(self) -> io.BytesIO:
         wav = io.BytesIO()
         with wave.open(wav, 'wb') as f:
             f.setnchannels(self.channels)
@@ -128,7 +161,7 @@ class Audio:
         return wav
 
     def silence(self, frames: int) -> 'Audio':
-        return Audio(channels=self.channels, width=self.width, rate=self.rate, data=b'\x00' * (self.channels * self.width))
+        return self.clone(b'\x00' * (frames * self.framewidth))
 
     def play(self):
         """Useful for debugging"""
@@ -137,3 +170,42 @@ class Audio:
             play.wait_done()
         except KeyboardInterrupt:
             play.stop()
+
+
+class Registry:
+    def __init__(self):
+        self.skills = {}
+
+    def skill(self, name):
+        def decorator(func):
+            self.skills[name] = func
+            logger.info(f"Loaded skill '{name}'")
+            return func
+        return decorator
+
+    async def run_skill(self, bot, user, skill, parameters):
+        if skill in self.skills:
+            try:
+                state = self.load_state(skill, user)
+            except Exception as exc:
+                logger.debug(f"Cant load state for {skill}.{user} due to {exc}")
+                state = None
+            state = await self.skills[skill](bot, parameters, state)
+            if state:
+                self.save_state(skill, user, state)
+        else:
+            await bot.speak("такого я не умею")
+
+    def get_state_path(self, skill: str, user: str):
+        return f'skill-states/{skill}.{user}.pickle'
+
+    def load_state(self, skill: str, user: str):
+        with open(self.get_state_path(skill, user), 'rb') as f:
+            return pickle.load(f)
+
+    def save_state(self, skill: str, user: str, state):
+        with open(self.get_state_path(skill, user), 'wb') as f:
+            return pickle.dump(state, f)
+
+
+registry = Registry()
