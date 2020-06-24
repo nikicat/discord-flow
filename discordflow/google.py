@@ -1,68 +1,61 @@
-import audioop
-import io
 import logging
 import os
-import wave
+from dataclasses import dataclass
+from typing import Dict
 
 import dialogflow_v2.types
-from discord.opus import Decoder, Encoder
 from google.cloud import texttospeech, speech_v1p1beta1
 
-from .utils import sync_to_async, SAMPLE_WIDTH
+from .utils import sync_to_async, Audio
 
 logger = logging.getLogger(__name__)
 
 
-async def text_to_speech(text):
+async def text_to_speech(text) -> Audio:
     voice = texttospeech.VoiceSelectionParams(
         language_code='ru_RU', ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
     )
     client = texttospeech.TextToSpeechClient()
     synthesis_input = texttospeech.SynthesisInput(text=text)
+    rate = 48000
     audio_config = texttospeech.AudioConfig(
         audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-        sample_rate_hertz=Encoder.SAMPLING_RATE,
+        sample_rate_hertz=rate,
     )
     response = await sync_to_async(
         client.synthesize_speech, input=synthesis_input, voice=voice, audio_config=audio_config,
     )
-    data = io.BytesIO(response.audio_content)
-    audio = wave.open(data, 'rb')
-    frames = audio.readframes(9999999)
-    if False:
-        converted, _ = audioop.ratecv(
-            frames, audio.getsampwidth(), audio.getnchannels(), audio.getframerate(), Encoder.SAMPLING_RATE,
-            None,
-        )
-    return audioop.tostereo(frames, audio.getsampwidth(), 1, 1)
+    return Audio.loads(response.audio_content)
 
 
-async def speech_to_text(audio):
+async def speech_to_text(audio: Audio):
     client = speech_v1p1beta1.SpeechClient()
-
-    # The language of the supplied audio
     language_code = "ru-RU"
-
-    # Sample rate in Hertz of the audio data sent
-    sample_rate_hertz = Decoder.SAMPLING_RATE
 
     # TODO: replace with AUDIO_ENCODING_OGG_OPUS
     encoding = speech_v1p1beta1.enums.RecognitionConfig.AudioEncoding.LINEAR16
     config = {
         "language_code": language_code,
-        "sample_rate_hertz": sample_rate_hertz,
+        "sample_rate_hertz": audio.rate,
         "encoding": encoding,
     }
-    mono = audioop.tomono(audio, SAMPLE_WIDTH, 0.5, 0.5)
-    audio = {"content": mono}
+    audio = {"content": audio.to_mono().data}
 
     response = await sync_to_async(client.recognize, config, audio)
     transcript = response.results[0].alternatives[0].transcript
-    logger.debug(f"Google STT result: {response} {transcript}")
+    logger.info(f"STT: {response} {transcript}")
     return transcript
 
 
-async def detect_intent(utterance: str, session_id: str):
+@dataclass
+class Intent:
+    text: str
+    parameters: Dict[str, str]
+    action: str
+    all_required_params_present: bool
+
+
+async def detect_intent(utterance: str, session_id: str) -> Intent:
     dialogflow_project_id = os.getenv('DIALOGFLOW_PROJECT_ID')
     client = dialogflow_v2.SessionsClient()
     session = client.session_path(dialogflow_project_id, session_id)
@@ -72,16 +65,16 @@ async def detect_intent(utterance: str, session_id: str):
             text=utterance, language_code='ru',
         ))
         kwargs = {}
-    elif isinstance(utterance, bytes):
+    elif isinstance(utterance, Audio):
         query_input = dialogflow_v2.types.QueryInput(audio_config=dialogflow_v2.types.InputAudioConfig(
             audio_encoding=client.enums.AudioEncoding.AUDIO_ENCODING_LINEAR_16,
-            sample_rate_hertz=Decoder.SAMPLING_RATE,
+            sample_rate_hertz=utterance.rate,
             language_code='ru',
             enable_word_info=True,
         ))
-        kwargs = dict(input_audio=audioop.tomono(utterance, SAMPLE_WIDTH, 0.5, 0.5))
+        kwargs = dict(input_audio=utterance.to_mono().data)
     else:
-        raise ValueError(f"utterance should be audio (bytes) or text (str), not {type(utterance)}")
+        raise ValueError(f"utterance should be Audio or text (str), not {type(utterance)}")
 
     response = await sync_to_async(
         client.detect_intent,
@@ -89,4 +82,9 @@ async def detect_intent(utterance: str, session_id: str):
         query_input=query_input,
         **kwargs,
     )
-    return response
+    return Intent(
+        text=response.query_result.filfillment_text,
+        parameters={field.name: field.string_value for field in response.query_result.parameters.fields},
+        action=response.query_result.action,
+        all_required_params_present=response.query_result.all_required_params_present,
+    )

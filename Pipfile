@@ -17,6 +17,8 @@ google-search-api = "*"
 google-search-results = "*"
 "discord.py" = {git = "https://github.com/imayhaveborkedit/discord.py"}
 google-cloud-texttospeech = "*"
+google-cloud-speech = "*"
+simpleaudio = "*"
 
 [requires]
 python_version = "3.8"
