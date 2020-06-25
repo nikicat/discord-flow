@@ -282,9 +282,6 @@ class DemultiplexerSink(AudioSink):
 
 
 class DialogflowCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-
     @commands.command()
     async def join(self, ctx):
         """Joins a voice channel"""
@@ -381,5 +378,5 @@ def setup_logging():
 def main():
     setup_logging()
     from . import cities  # noqa to load skills
-    bot.add_cog(DialogflowCog(bot))
+    bot.add_cog(DialogflowCog())
     bot.run(os.getenv('TOKEN'))

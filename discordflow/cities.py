@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_next_letter(city):
-    return re.sub('[ьъ]', '', city)[-1]
+    return re.sub('[ыьъ]', '', city)[-1]
 
 
 def normalize_city(city):
