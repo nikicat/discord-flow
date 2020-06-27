@@ -5,7 +5,6 @@ import os
 import importlib
 import time
 from contextlib import suppress, asynccontextmanager
-from itertools import count
 from struct import Struct
 from typing import List
 
@@ -41,6 +40,7 @@ class PorcupineSink:
         self.keywords = parent.keywords
         self.play = parent.play
         self.play_loop = parent.play_loop
+        self.play_stream = parent.play_stream
 
         self.listen_task = BackgroundTask()
         self.listen_task.start(self.main_loop())
@@ -140,7 +140,7 @@ class PorcupineSink:
             await self.speak(answer)
         elif intent.action == 'skill':
             skill = intent.parameters['skill']
-            await registry.run_skill(self, self.user, skill, intent.parameters)
+            await registry.run_skill(skill, self, self.user, **intent.parameters)
         elif intent.action:
             logger.warning(f"Unknown action {intent.action}")
             await self.speak(f"Неизвестный экшен: {intent.action}")
@@ -205,6 +205,33 @@ class PorcupineSink:
         self.pcp.delete()
 
 
+async def aiter(iter_):
+    for i in iter_:
+        yield i
+
+
+async def size_limit(audio_iter, size):
+    buf = None
+    async for packet in audio_iter:
+        buf = buf + packet if buf else packet
+        while len(buf) >= size:
+            yield buf[:size]
+            buf = buf[size:]
+    if buf:
+        yield buf
+
+
+async def rate_limit(audio_iter):
+    when_to_wake = time.perf_counter()
+    async for packet in audio_iter:
+        yield packet
+        when_to_wake += packet.duration
+        to_sleep = when_to_wake - time.perf_counter()
+        await asyncio.sleep(to_sleep)
+    if packet:
+        yield packet
+
+
 class DemultiplexerSink(AudioSink):
     def __init__(self, voice_client: VoiceClient, keywords: List[str]):
         self.client = voice_client
@@ -224,35 +251,21 @@ class DemultiplexerSink(AudioSink):
             self.users[data.user] = PorcupineSink(self, self.keywords, data.user)
         self.users[data.user].write(data)
 
-    def read(self):
-        result = b''
-        if self.output:
-            result += self.output[:Encoder.FRAME_SIZE]
-            self.output = self.output[Encoder.FRAME_SIZE:]
-        elif self.loop_output:
-            start = self.loop_position
-            stop = start + Encoder.FrameSize
-            result = self.loop_output[start:stop]
-            self.loop_position = stop if stop < len(self.loop_output) else 0
-        if len(result) < Encoder.FRAME_SIZE:
-            result += b'\x00' * (Encoder.FRAME_SIZE - len(result))
-        return result
+    async def play_stream(self, stream):
+        async with self.speaking():
+            async for frame in rate_limit(size_limit(stream, Encoder.SAMPLES_PER_FRAME)):
+                await self.send_packet(frame)
 
     async def play(self, sound: Audio):
         async with self.speaking():
-            when_to_wake = time.perf_counter()
-            for packet_number in count():
-                offset = packet_number * Encoder.SAMPLES_PER_FRAME
-                packet = sound[offset:offset + Encoder.SAMPLES_PER_FRAME]
-                if not packet:
-                    break
+            async for packet in rate_limit(size_limit(aiter([sound]), Encoder.SAMPLES_PER_FRAME)):
                 if len(packet) < Encoder.SAMPLES_PER_FRAME:
                     # To avoid "clatz" in the end
                     packet += packet.silence(Encoder.SAMPLES_PER_FRAME - len(packet))
-                self.client.send_audio_packet(packet.to_stereo().to_rate(Encoder.SAMPLING_RATE).data)
-                when_to_wake += Encoder.FRAME_LENGTH / 1000
-                to_sleep = when_to_wake - time.perf_counter()
-                await asyncio.sleep(to_sleep)
+                await self.send_packet(packet)
+
+    async def send_packet(self, packet: Audio):
+        self.client.send_audio_packet(packet.to_stereo().to_rate(Encoder.SAMPLING_RATE).data)
 
     async def play_loop(self, sound: Audio):
         async with self.speaking():
@@ -299,6 +312,11 @@ class DialogflowCog(commands.Cog):
     async def listen(self, ctx, keyword: str):
         DemultiplexerSink(ctx.voice_client, keywords=[keyword])
 
+    @commands.command()
+    async def youtube_dl(self, ctx, url: str):
+        skill_ctx = voice_bot.users[ctx.author]
+        await registry.run_skill('youtube-dl', skill_ctx, ctx.author, url)
+
     @join.before_invoke
     @listen.before_invoke
     async def ensure_voice(self, ctx):
@@ -311,10 +329,6 @@ class DialogflowCog(commands.Cog):
                 raise commands.CommandError("Author not connected to a voice channel.")
         elif ctx.voice_client.is_playing():
             ctx.voice_client.stop()
-
-
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"),
-                   description='Relatively simple music bot example')
 
 
 @registry.skill('quest')
@@ -335,6 +349,10 @@ class DiscordHandler(logging.Handler):
         asyncio.run_coroutine_threadsafe(self.send_message(getattr(record, 'speech', None), self.format(record)), self.loop)
 
 
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), description='Relatively simple music bot example')
+voice_bot = None
+
+
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user}")
@@ -347,7 +365,8 @@ async def on_ready():
         logging.getLogger(logger_name).addHandler(handler)
     voice_channel = bot.get_channel(653229977545998350)
     voice_client = await voice_channel.connect()
-    sink = DemultiplexerSink(voice_client, [
+    global voice_bot
+    voice_bot = DemultiplexerSink(voice_client, [
         'view glass',
         'grasshopper',
         'blueberry',
@@ -363,11 +382,11 @@ async def on_ready():
         'computer',
         'terminator',
     ])
-    await sink.play(sink.hello)
+    await voice_bot.play(voice_bot.hello)
 
 
 def setup_logging():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)-15s %(levelname)s[%(name)-20s] %(message)s')
     logging.getLogger('discord.gateway').setLevel(logging.WARNING)
     for level, name in logging._levelToName.items():
         for logger_name in os.getenv(f'LOGGERS_{name}', '').split(','):
@@ -377,6 +396,6 @@ def setup_logging():
 
 def main():
     setup_logging()
-    from . import cities  # noqa to load skills
+    from . import cities, youtubedl  # noqa to load skills
     bot.add_cog(DialogflowCog())
     bot.run(os.getenv('TOKEN'))

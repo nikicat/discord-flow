@@ -100,6 +100,9 @@ class Audio:
         """Audio length in frames"""
         return len(self.data) // self.framewidth
 
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
     @property
     def duration(self) -> float:
         """Duration in seconds"""
@@ -183,14 +186,14 @@ class Registry:
             return func
         return decorator
 
-    async def run_skill(self, bot, user, skill, parameters):
+    async def run_skill(self, skill, bot, user, *args, **kwargs):
         if skill in self.skills:
             try:
                 state = self.load_state(skill, user)
             except Exception as exc:
                 logger.debug(f"Cant load state for {skill}.{user} due to {exc}")
                 state = None
-            state = await self.skills[skill](bot, parameters, state)
+            state = await self.skills[skill](bot, state, *args, **kwargs)
             if state:
                 self.save_state(skill, user, state)
         else:
