@@ -2,31 +2,27 @@ import asyncio
 import logging
 import logging.handlers
 import os
-import importlib
-import time
 from contextlib import suppress, asynccontextmanager
 from struct import Struct
 from typing import List
 
-import pkg_resources
 import webrtcvad
-importlib.reload(pkg_resources)  # HACK: https://github.com/googleapis/google-api-python-client/issues/476#issuecomment-371797043
 
 from discord import File, SpeakingState, VoiceClient
 from discord.ext import commands
 from discord.opus import Decoder, Encoder, _load_default
-from discord.reader import AudioSink
+from discord.reader import AudioSink, AudioReader
 from pvporcupine import create
-from serpapi.google_search_results import GoogleSearchResults
 
-from .utils import sync_to_async, BackgroundTask, Interrupted, Audio, registry, background_task, EmptyUtterance
+from .google import detect_intent, set_contexts
+from .utils import BackgroundTask, Interrupted, Audio, registry, background_task, EmptyUtterance, rate_limit, size_limit, aiter
 from .yandex import text_to_speech, speech_to_text
-from .google import detect_intent
+from .skills import *  # noqa to load skills
 
 logger = logging.getLogger(__name__)
 
 
-class PorcupineSink:
+class UserSink:
     def __init__(self, parent, keywords, user):
         self.parent = parent
         self.user = user
@@ -41,30 +37,30 @@ class PorcupineSink:
         self.play = parent.play
         self.play_loop = parent.play_loop
         self.play_stream = parent.play_stream
-
-        self.listen_task = BackgroundTask()
-        self.listen_task.start(self.main_loop())
+        self.play_interruptible = parent.play_interruptible
+        self.speak = parent.speak
         self.vad = webrtcvad.Vad(3)
+        self.listen_task = BackgroundTask()
+        self.listen_task.start(self.listen_loop())
+        logger.info(f"Started {self!r}")
 
-        logger.debug(f'Started Porcupine sink {self!r}')
+    def __repr__(self):
+        return f'{type(self).__name__}<{self.user}>'
 
     def detect_wuw(self, sound: Audio):
         result = self.pcp.process(self.unpacker.unpack(sound.data))
         if result >= 0:
             return self.keywords[result]
 
-    async def main_loop(self):
-        while True:
-            try:
-                await self.wait_for_wuw()
-                utterance: Audio = await self.listen_utterance()
+    async def process_wakeup(self):
+        try:
+            utterance: Audio = await self.listen_utterance()
+            with set_contexts():
                 await self.process_utterance(utterance)
-            except EmptyUtterance:
-                await self.speak("В следующий раз я тоже тебе не отвечу!")
-            except Interrupted:
-                pass
-            except Exception as exc:
-                logger.exception(f"Exception in main loop: {exc}")
+        except EmptyUtterance:
+            await self.speak("В следующий раз я тоже тебе не отвечу!")
+        except Interrupted:
+            logger.info(f"{self!r} interrupted")
 
     async def wait_for_wuw(self) -> str:
         """Listen for wake up word and return it"""
@@ -79,8 +75,17 @@ class PorcupineSink:
                     logger.debug(f'Detected keyword "{keyword}"')
                     return keyword
 
+    async def listen_loop(self):
+        while True:
+            try:
+                await self.wait_for_wuw()
+                async with self.parent.attention:
+                    await self.process_wakeup()
+            except Exception as exc:
+                logger.exception(f"Unexpected exception in {self!r}.listen_loop: {exc}")
+
     async def listen_utterance(self, timeout=2.3) -> Audio:
-        logger.debug(f"Listening utterance with timeout {timeout}")
+        logger.info(f"Start listening utterance with timeout {timeout}")
         async with background_task(self.play_loop(self.ticktock)):
             sound = Audio(channels=Decoder.CHANNELS, width=2, rate=Decoder.SAMPLING_RATE)
             speech_count = 0
@@ -98,48 +103,32 @@ class PorcupineSink:
                     logger.info("Stop listening utterance")
                     if len(sound) == 0:
                         raise EmptyUtterance()
+                    logger.info(f"Listened speech: {sound.duration}s", extra=dict(speech=sound))
                     return sound
 
     async def listen(self) -> Audio:
         return await self.input_queue.get()
 
-    def write(self, data):
-        self.input_queue.put_nowait(Audio(data=data.pcm, channels=2, width=2, rate=48000))
-        logger.log(5, f'write: {data.user}. qsize={self.input_queue.qsize()}')
-
-    async def play_interruptible(self, answer: Audio):
-        logger.debug("Playing answer")
-        wait_for_wuw = self.wait_for_wuw()
-        play = self.play(answer)
-        done, pending = await asyncio.wait([wait_for_wuw, play], return_when=asyncio.FIRST_COMPLETED)
-        pending = pending.pop()
-        pending.cancel()
-        with suppress(asyncio.CancelledError):
-            await pending
-        if pending.get_coro() is play:
-            logger.debug("Interrupting")
-            raise Interrupted
+    async def feed(self, audio: Audio):
+        self.input_queue.put_nowait(audio)
+        logger.debug(f'feed: {self!r}. qsize={self.input_queue.qsize()}')
 
     async def process_utterance(self, utterance: Audio):
         text = await speech_to_text(utterance)
         if not text:
             raise EmptyUtterance()
-        intent = await detect_intent(text, self.user)
-        logger.info(f"Response: {intent}")
+        intent = await detect_intent(self.user, text)
         query = intent.parameters.get('query', text)
         if intent.text:
             await self.speak(intent.text)
             if not intent.all_required_params_present:
                 user_answer: Audio = await self.listen_utterance()
                 await self.process_utterance(user_answer)
-        if intent.action == 'google.search':
-            answer = await self.google_search(query)
-            await self.speak(answer)
-        elif intent.action == 'format':
+        if intent.action == 'format':
             answer = intent.text.format(query=query)
             await self.speak(answer)
-        elif intent.action == 'skill':
-            skill = intent.parameters['skill']
+        elif intent.action.startswith('skill.'):
+            skill = intent.action.split('skill.')[-1]
             await registry.run_skill(skill, self, self.user, **intent.parameters)
         elif intent.action:
             logger.warning(f"Unknown action {intent.action}")
@@ -147,7 +136,7 @@ class PorcupineSink:
 
     async def ask(self, question, timeout=4, tries=1):
         request = await text_to_speech(text=question)
-        await self.play_interruptible(request)
+        await self.play(request)
         while True:
             try:
                 speech = await self.listen_utterance(timeout=timeout)
@@ -162,74 +151,39 @@ class PorcupineSink:
                 else:
                     raise
 
-    async def google_search(self, query):
-        params = dict(
-            engine='google',
-            q=query,
-            api_key=os.getenv('SERPAPI_KEY'),
-            gl='ru',
-            hl='ru',
-        )
+    async def ask_and_detect_intent(self, question, timeout=4, tries=3):
+        request = await text_to_speech(text=question)
+        await self.play(request)
+        while (tries := tries - 1) >= 0:
+            try:
+                speech = await self.listen_utterance(timeout=timeout)
+            except EmptyUtterance:
+                await self.speak("Ну что же ты молчишь?")
+            else:
+                intent = await detect_intent(self.user, speech=speech)
+                if intent.action == 'repeat':
+                    await self.play(request)
+                    tries += 1
+                elif intent.action == 'fallback':
+                    await self.speak(intent.text)
+                else:
+                    return intent
+        else:
+            raise EmptyUtterance
 
-        client = await sync_to_async(GoogleSearchResults, params)
-        results = client.get_dict()
-        answer = None
-        logger.debug(f'serp results: {results}')
-        if 'knowledge_graph' in results:
-            knowledge_graph = results['knowledge_graph']
-            if 'description' in knowledge_graph:
-                answer = knowledge_graph['description']
-                logger.debug(f'knowledge graph: {answer}')
-        if answer is None and 'answer_box' in results:
-            answer_box = results['answer_box']
-            if 'result' in answer_box:
-                answer = answer_box['result']
-                logger.debug(f'answer box result: {answer}')
-            elif 'snippet' in answer_box:
-                answer = answer_box['snippet']
-                logger.debug(f'answer box snippet: {answer}')
-        if answer is None and results.get('organic_results'):
-            answer = results['organic_results'][0].get('snippet')
-        return answer or "что-то я не нашла"
-
-    async def speak(self, text):
-        logger.debug(f"Speaking: {text}")
-        audio = await text_to_speech(text=text)
-        await self.play_interruptible(audio)
-
-    def ddg_search(self, query):
-        pass
+    async def ask_yes_no(self, question: str):
+        with set_contexts('yes-no'):
+            intent = await self.ask_and_detect_intent(question)
+            return intent.action == 'yes'
 
     async def close(self):
-        await self.listen_task.stop()
         self.pcp.delete()
 
-
-async def aiter(iter_):
-    for i in iter_:
-        yield i
-
-
-async def size_limit(audio_iter, size):
-    buf = None
-    async for packet in audio_iter:
-        buf = buf + packet if buf else packet
-        while len(buf) >= size:
-            yield buf[:size]
-            buf = buf[size:]
-    if buf:
-        yield buf
-
-
-async def rate_limit(audio_iter):
-    when_to_wake = time.perf_counter()
-    async for packet in audio_iter:
-        yield packet
-        when_to_wake += packet.duration
-        to_sleep = when_to_wake - time.perf_counter()
-        await asyncio.sleep(to_sleep)
-    if packet:
-        yield packet
+    async def on_welcome(self):
+        logger.info(f"Welcome {self.user}")
+        intent = await detect_intent(self.user, event='WELCOME', params=dict(name=self.user.name), contexts=None)
+        if intent.text:
+            await self.speak(intent.text)
 
 
 class DemultiplexerSink(AudioSink):
@@ -243,13 +197,37 @@ class DemultiplexerSink(AudioSink):
         self.that = Audio.load('that2.wav')
         self.hello = Audio.load('hello.wav')
         self.ticktock = Audio.load('ticktock.wav')
-        voice_client.listen(self)
-        logger.debug('Started Demultiplexer sink')
+        self.wakeups = asyncio.Queue()
+        self.reader = AudioReader(self, voice_client)
+        self.demux_task = BackgroundTask()
+        self.attention = asyncio.Lock()
 
-    def write(self, data):
-        if data.user not in self.users:
-            self.users[data.user] = PorcupineSink(self, self.keywords, data.user)
-        self.users[data.user].write(data)
+    def start(self):
+        self.demux_task.start(self.demux_loop())
+        logger.debug("Started DemultiplexerSink")
+
+    async def cleanup(self):
+        # TODO: move to __aenter__/__aexit__
+        if self.deleted:
+            return
+        self.deleted = True
+        logger.debug(f"Deleting {self!r}")
+        for usersink in self.users.values():
+            await usersink.close()
+
+    async def demux_loop(self):
+        async for voice_data in self.reader.listen_voice():
+            try:
+                sink = self.get_user_sink(voice_data.user)
+                audio = Audio(data=voice_data.pcm, channels=2, width=2, rate=48000)
+                await sink.feed(audio)
+            except Exception as exc:
+                logger.exception(f"Unexpected exception in {self!r}.demux_loop: {exc}")
+
+    def get_user_sink(self, user):
+        if user not in self.users:
+            self.users[user] = UserSink(self, self.keywords, user)
+        return self.users[user]
 
     async def play_stream(self, stream):
         async with self.speaking():
@@ -272,6 +250,25 @@ class DemultiplexerSink(AudioSink):
             while True:
                 await self.play(sound)
 
+    async def play_interruptible(self, audio: Audio):
+        logger.debug("Playing interruptible")
+        waiters = {sink.wait_for_wuw(): user for user, sink in self.users.items()}
+        play = self.play(audio)
+        done, pending = await asyncio.wait(list(waiters) + [play], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        done_coro = done.pop().get_coro()
+        if done_coro in waiters:
+            logger.debug(f"Interrupted by {waiters[done_coro]}")
+            raise Interrupted
+
+    async def speak(self, text):
+        logger.debug(f"Speaking: {text}")
+        audio = await text_to_speech(text=text)
+        await self.play_interruptible(audio)
+
     @asynccontextmanager
     async def speaking(self):
         if self.is_speaking:
@@ -285,13 +282,8 @@ class DemultiplexerSink(AudioSink):
                 self.is_speaking = False
                 await self.client.ws.speak(SpeakingState.inactive())
 
-    async def cleanup(self):
-        if self.deleted:
-            return
-        self.deleted = True
-        logger.debug('Deleting Porcupine')
-        for usersink in self.users.values():
-            await usersink.close()
+    async def on_welcome(self, user):
+        await self.get_user_sink(user).on_welcome()
 
 
 class DialogflowCog(commands.Cog):
@@ -309,16 +301,11 @@ class DialogflowCog(commands.Cog):
         await ctx.voice_client.disconnect()
 
     @commands.command()
-    async def listen(self, ctx, keyword: str):
-        DemultiplexerSink(ctx.voice_client, keywords=[keyword])
-
-    @commands.command()
     async def youtube_dl(self, ctx, url: str):
         skill_ctx = voice_bot.users[ctx.author]
         await registry.run_skill('youtube-dl', skill_ctx, ctx.author, url)
 
     @join.before_invoke
-    @listen.before_invoke
     async def ensure_voice(self, ctx):
         if ctx.voice_client is None:
             if ctx.author.voice:
@@ -382,7 +369,14 @@ async def on_ready():
         'computer',
         'terminator',
     ])
+    voice_bot.start()
     await voice_bot.play(voice_bot.hello)
+
+
+@bot.event
+async def on_voice_state_update(user, old_state, new_state):
+    if user != bot.user and old_state.channel is None and new_state.channel is not None:
+        await voice_bot.on_welcome(user)
 
 
 def setup_logging():
@@ -396,6 +390,6 @@ def setup_logging():
 
 def main():
     setup_logging()
-    from . import cities, youtubedl  # noqa to load skills
+    logger.info(f"Loaded skills: {list(registry.skills)}")
     bot.add_cog(DialogflowCog())
     bot.run(os.getenv('TOKEN'))

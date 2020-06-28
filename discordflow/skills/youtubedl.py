@@ -4,7 +4,7 @@ import logging
 import youtube_dl
 from discord.opus import Encoder
 
-from .utils import registry, sync_to_async, Audio
+from ..utils import registry, sync_to_async, Audio
 
 
 logger = logging.getLogger(__name__)

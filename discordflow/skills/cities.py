@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from itertools import groupby
 
-from .utils import registry, EmptyUtterance
+from ..utils import registry, EmptyUtterance
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class Lose(Exception):
 
 
 @registry.skill('cities')
-async def cities_skill(bot, parameters, user_state: UserState):
+async def cities_skill(bot, user_state: UserState):
     user_state = user_state or UserState()
     cities = load_cities()
     orig_cities = deepcopy(cities)

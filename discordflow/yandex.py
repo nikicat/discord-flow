@@ -18,7 +18,7 @@ async def request_yandex(url: str, **kwargs):
                 response.raise_for_status()
                 return body
         except aiohttp.client_exceptions.ClientResponseError as exc:
-            breakpoint()
+            logger.exception(f"Unexpected exception while requesting Yandex.API: {exc}")
             raise
 
 
@@ -45,5 +45,5 @@ async def speech_to_text(speech: Audio):
         data=speech.to_mono().data,
     )
     result = json.loads(response)['result']
-    logger.info(f"STT: {speech} -> {result}", extra=dict(speech=speech))
+    logger.info(f"STT: {result}")
     return result

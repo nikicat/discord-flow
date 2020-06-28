@@ -3,6 +3,7 @@ import audioop
 import io
 import logging
 import pickle
+import time
 import wave
 from contextlib import suppress, asynccontextmanager
 from dataclasses import dataclass
@@ -179,10 +180,11 @@ class Registry:
     def __init__(self):
         self.skills = {}
 
-    def skill(self, name):
+    def skill(self, name=None):
         def decorator(func):
-            self.skills[name] = func
-            logger.info(f"Loaded skill '{name}'")
+            skill_name = name or func.__name__
+            self.skills[skill_name] = func
+            logger.info(f"Loaded skill '{skill_name}'")
             return func
         return decorator
 
@@ -212,3 +214,30 @@ class Registry:
 
 
 registry = Registry()
+
+
+async def aiter(iter_):
+    for i in iter_:
+        yield i
+
+
+async def size_limit(audio_iter, size):
+    buf = None
+    async for packet in audio_iter:
+        buf = buf + packet if buf else packet
+        while len(buf) >= size:
+            yield buf[:size]
+            buf = buf[size:]
+    if buf:
+        yield buf
+
+
+async def rate_limit(audio_iter):
+    when_to_wake = time.perf_counter()
+    async for packet in audio_iter:
+        yield packet
+        when_to_wake += packet.duration
+        to_sleep = when_to_wake - time.perf_counter()
+        await asyncio.sleep(to_sleep)
+    if packet:
+        yield packet
