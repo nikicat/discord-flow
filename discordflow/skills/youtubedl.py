@@ -26,7 +26,7 @@ async def play_ffmpeg(url):
         await proc.wait()
 
 
-@registry.skill('youtube-dl')
+@registry.skill()
 async def youtubedl(bot, user_state, url):
     ytdl = youtube_dl.YoutubeDL(dict(format='bestaudio/best'))
     data = await sync_to_async(ytdl.extract_info, url, download=False)

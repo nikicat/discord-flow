@@ -85,7 +85,7 @@ class UserSink:
                 logger.exception(f"Unexpected exception in {self!r}.listen_loop: {exc}")
 
     async def listen_utterance(self, timeout=2.3) -> Audio:
-        logger.info(f"Start listening utterance with timeout {timeout}")
+        logger.info(f"{self!r} start listening utterance with timeout {timeout}")
         async with background_task(self.play_loop(self.ticktock)):
             sound = Audio(channels=Decoder.CHANNELS, width=2, rate=Decoder.SAMPLING_RATE)
             speech_count = 0
@@ -96,14 +96,14 @@ class UserSink:
                     packet = await asyncio.wait_for(self.listen(), timeout=actual_timeout)
                     sound += packet
                     is_speech = self.vad.is_speech(packet.to_mono().to_rate(16000).data, 16000)
-                    logger.debug(f"Speech packet: is_speech={is_speech} rms={packet.rms}")
+                    logger.debug(f"{self!r} speech packet: is_speech={is_speech} rms={packet.rms}")
                     if is_speech:
                         speech_count += 1
                 except asyncio.TimeoutError:
-                    logger.info("Stop listening utterance")
+                    logger.info(f"{self!r} stop listening utterance")
                     if len(sound) == 0:
                         raise EmptyUtterance()
-                    logger.info(f"Listened speech: {sound.duration}s", extra=dict(speech=sound))
+                    logger.info(f"{self!r} listened speech: {sound.duration}s", extra=dict(speech=sound))
                     return sound
 
     async def listen(self) -> Audio:
@@ -131,8 +131,8 @@ class UserSink:
             skill = intent.action.split('skill.')[-1]
             await registry.run_skill(skill, self, self.user, **intent.parameters)
         elif intent.action:
-            logger.warning(f"Unknown action {intent.action}")
-            await self.speak(f"Неизвестный экшен: {intent.action}")
+            logger.warning(f"{self!r} unknown action {intent.action}")
+            await self.speak(f"неизвестный экшен: {intent.action}")
 
     async def ask(self, question, timeout=4, tries=1):
         request = await text_to_speech(text=question)
@@ -181,7 +181,7 @@ class UserSink:
 
     async def on_welcome(self):
         logger.info(f"Welcome {self.user}")
-        intent = await detect_intent(self.user, event='WELCOME', params=dict(name=self.user.name), contexts=None)
+        intent = await detect_intent(self.user, event='WELCOME', params=dict(name=self.user.name))
         if intent.text:
             await self.speak(intent.text)
 
@@ -230,6 +230,9 @@ class DemultiplexerSink(AudioSink):
         return self.users[user]
 
     async def play_stream(self, stream):
+        return await self.run_interruptible(self.play_stream_impl(stream))
+
+    async def play_stream_impl(self, stream):
         async with self.speaking():
             async for frame in rate_limit(size_limit(stream, Encoder.SAMPLES_PER_FRAME)):
                 await self.send_packet(frame)
@@ -250,11 +253,11 @@ class DemultiplexerSink(AudioSink):
             while True:
                 await self.play(sound)
 
-    async def play_interruptible(self, audio: Audio):
+    async def run_interruptible(self, coro):
         logger.debug("Playing interruptible")
+        # FIXME: listen for users those entered chat after start
         waiters = {sink.wait_for_wuw(): user for user, sink in self.users.items()}
-        play = self.play(audio)
-        done, pending = await asyncio.wait(list(waiters) + [play], return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(list(waiters) + [coro], return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
             with suppress(asyncio.CancelledError):
@@ -263,6 +266,9 @@ class DemultiplexerSink(AudioSink):
         if done_coro in waiters:
             logger.debug(f"Interrupted by {waiters[done_coro]}")
             raise Interrupted
+
+    async def play_interruptible(self, audio: Audio):
+        return await self.run_interruptible(self.play(audio))
 
     async def speak(self, text):
         logger.debug(f"Speaking: {text}")
@@ -344,13 +350,14 @@ voice_bot = None
 async def on_ready():
     logger.info(f"Logged in as {bot.user}")
     _load_default()
-    handler = DiscordHandler(bot.get_channel(653229977545998349))
+    channels = {channel.name: channel for channel in bot.get_all_channels()}
+    handler = DiscordHandler(channels['bot-logs'])
     handler.setLevel(logging.INFO)
     formatter = logging.Formatter('%(name)s: %(message)s')
     handler.setFormatter(formatter)
     for logger_name in os.getenv('LOGGERS_DISCORD').split(','):
         logging.getLogger(logger_name).addHandler(handler)
-    voice_channel = bot.get_channel(653229977545998350)
+    voice_channel = channels['devs-voice']
     voice_client = await voice_channel.connect()
     global voice_bot
     voice_bot = DemultiplexerSink(voice_client, [
