@@ -6,12 +6,14 @@ import pickle
 import time
 import wave
 from contextlib import suppress, asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 
 import simpleaudio
 
 logger = logging.getLogger(__name__)
+language = ContextVar('language', default='en_US')
 
 
 class Interrupted(Exception):
@@ -144,7 +146,7 @@ class Audio:
     def load(cls, fp: str) -> 'Audio':
         with wave.open(fp, 'rb') as f:
             return Audio(
-                data=f.readframes(100000),
+                data=f.readframes(2 ** 32),
                 channels=f.getnchannels(),
                 width=f.getsampwidth(),
                 rate=f.getframerate(),

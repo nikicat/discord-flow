@@ -19,6 +19,10 @@ google-search-results = "*"
 google-cloud-texttospeech = "*"
 google-cloud-speech = "*"
 simpleaudio = "*"
+transformers = "*"
+parlai = "*"
+subword-nmt = {git = "https://github.com/rsennrich/subword-nmt.git"}
+coloredlogs = "*"
 
 [requires]
 python_version = "3.8"

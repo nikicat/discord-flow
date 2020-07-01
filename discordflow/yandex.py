@@ -4,9 +4,13 @@ import os
 
 import aiohttp
 
-from .utils import Audio
+from .utils import Audio, language
 
 logger = logging.getLogger(__name__)
+
+
+def get_lang():
+    return language.get().replace('_', '-')
 
 
 async def request_yandex(url: str, **kwargs):
@@ -18,7 +22,7 @@ async def request_yandex(url: str, **kwargs):
                 response.raise_for_status()
                 return body
         except aiohttp.client_exceptions.ClientResponseError as exc:
-            logger.exception(f"Unexpected exception while requesting Yandex.API: {exc}")
+            logger.exception(f"Unexpected exception while requesting Yandex.API: {exc} ({body})")
             raise
 
 
@@ -33,7 +37,7 @@ async def text_to_speech(text=None, ssml=None) -> Audio:
         kwargs = dict(ssml=ssml)
     data = await request_yandex(
         'https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize',
-        data=dict(format='lpcm', sampleRateHertz=rate, **kwargs),
+        data=dict(format='lpcm', sampleRateHertz=rate, lang=get_lang(), **kwargs),
     )
     return Audio(data=data, channels=1, rate=rate, width=2)
 
@@ -41,7 +45,7 @@ async def text_to_speech(text=None, ssml=None) -> Audio:
 async def speech_to_text(speech: Audio):
     response = await request_yandex(
         'https://stt.api.cloud.yandex.net/speech/v1/stt:recognize',
-        params=dict(format='lpcm', sampleRateHertz=speech.rate),  # TODO: add channels and width
+        params=dict(format='lpcm', sampleRateHertz=speech.rate, lang=get_lang()),  # TODO: add channels and width
         data=speech.to_mono().data,
     )
     result = json.loads(response)['result']

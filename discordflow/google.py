@@ -16,14 +16,16 @@ from discord import Member
 from google.cloud import texttospeech, speech_v1p1beta1
 from google.protobuf.struct_pb2 import Struct
 
-from .utils import sync_to_async, Audio
+from .utils import sync_to_async, Audio, language, EmptyUtterance
 
 logger = logging.getLogger(__name__)
 
 
 async def text_to_speech(text) -> Audio:
     voice = texttospeech.VoiceSelectionParams(
-        language_code='ru_RU', ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
+        language_code=language.get(),
+        ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
+        name='en-IN-Wavenet-B',
     )
     client = texttospeech.TextToSpeechClient()
     synthesis_input = texttospeech.SynthesisInput(text=text)
@@ -35,23 +37,26 @@ async def text_to_speech(text) -> Audio:
     response = await sync_to_async(
         client.synthesize_speech, input=synthesis_input, voice=voice, audio_config=audio_config,
     )
-    return Audio.loads(response.audio_content)
+    result = Audio.from_wav(response.audio_content)
+    logger.debug(f"TTS: {text} -> {result}")
+    return result
 
 
 async def speech_to_text(audio: Audio):
     client = speech_v1p1beta1.SpeechClient()
-    language_code = "ru-RU"
 
     # TODO: replace with AUDIO_ENCODING_OGG_OPUS
     encoding = speech_v1p1beta1.enums.RecognitionConfig.AudioEncoding.LINEAR16
     config = {
-        "language_code": language_code,
+        "language_code": language.get(),
         "sample_rate_hertz": audio.rate,
         "encoding": encoding,
     }
     audio = {"content": audio.to_mono().data}
 
     response = await sync_to_async(client.recognize, config, audio)
+    if not response.results:
+        raise EmptyUtterance
     transcript = response.results[0].alternatives[0].transcript
     logger.info(f"STT: {response} {transcript}")
     return transcript
@@ -101,17 +106,17 @@ async def detect_intent(
     logger.debug(f"Session: {session}")
     kwargs = {}
     if text:
-        query_input = QueryInput(text=TextInput(text=text, language_code=LANGUAGE))
+        query_input = QueryInput(text=TextInput(text=text, language_code=language.get()))
     elif speech:
         query_input = QueryInput(audio_config=InputAudioConfig(
             audio_encoding=client.enums.AudioEncoding.AUDIO_ENCODING_LINEAR_16,
             sample_rate_hertz=speech.rate,
-            language_code=LANGUAGE,
+            language_code=language.get(),
             enable_word_info=True,
         ))
         kwargs = dict(input_audio=speech.to_mono().data)
     elif event:
-        query_input = QueryInput(event=EventInput(name=event, parameters=make_parameters(params), language_code=LANGUAGE))
+        query_input = QueryInput(event=EventInput(name=event, parameters=make_parameters(params), language_code=language.get()))
     else:
         raise ValueError("One of `text`, `speech` or `event` should be set")
 

@@ -8,18 +8,35 @@ from typing import List
 
 import webrtcvad
 
-from discord import File, SpeakingState, VoiceClient
+import discord.utils
+from discord import File, SpeakingState, VoiceClient, Client
 from discord.ext import commands
 from discord.opus import Decoder, Encoder, _load_default
 from discord.reader import AudioSink, AudioReader
 from pvporcupine import create
 
+from . import yandex, google
 from .google import detect_intent, set_contexts
-from .utils import BackgroundTask, Interrupted, Audio, registry, background_task, EmptyUtterance, rate_limit, size_limit, aiter
-from .yandex import text_to_speech, speech_to_text
+from .utils import (
+    BackgroundTask, Interrupted, Audio, registry, background_task, EmptyUtterance, rate_limit, size_limit, aiter, language,
+)
 from .skills import *  # noqa to load skills
 
 logger = logging.getLogger(__name__)
+
+
+async def speech_to_text(audio: Audio):
+    if language.get() == 'ru_RU':
+        return await yandex.speech_to_text(audio)
+    else:
+        return await google.speech_to_text(audio)
+
+
+async def text_to_speech(text: str):
+    if language.get() == 'ru_RU':
+        return await yandex.text_to_speech(text)
+    else:
+        return await google.text_to_speech(text)
 
 
 class UserSink:
@@ -130,13 +147,13 @@ class UserSink:
         elif intent.action.startswith('skill.'):
             skill = intent.action.split('skill.')[-1]
             await registry.run_skill(skill, self, self.user, **intent.parameters)
+        elif intent.action == 'set-language':
+            language.set(intent.parameters['lang'])
         elif intent.action:
             logger.warning(f"{self!r} unknown action {intent.action}")
             await self.speak(f"неизвестный экшен: {intent.action}")
 
-    async def ask(self, question, timeout=4, tries=1):
-        request = await text_to_speech(text=question)
-        await self.play(request)
+    async def listen_text(self, timeout=4, tries=1):
         while True:
             try:
                 speech = await self.listen_utterance(timeout=timeout)
@@ -150,6 +167,11 @@ class UserSink:
                     await self.speak("Ну что же ты молчишь?")
                 else:
                     raise
+
+    async def ask(self, question, timeout=4, tries=1):
+        request = await text_to_speech(text=question)
+        await self.play(request)
+        return await self.listen_text(timeout, tries)
 
     async def ask_and_detect_intent(self, question, timeout=4, tries=3):
         request = await text_to_speech(text=question)
@@ -202,9 +224,16 @@ class DemultiplexerSink(AudioSink):
         self.demux_task = BackgroundTask()
         self.attention = asyncio.Lock()
 
-    def start(self):
+    def __str__(self):
+        return f'channel={self.client.channel}'
+
+    def __repr__(self):
+        return f'<{type(self).__name__}>[{self}]'
+
+    async def start(self):
         self.demux_task.start(self.demux_loop())
-        logger.debug("Started DemultiplexerSink")
+        logger.debug(f"Started {self!r}")
+        await self.play(self.hello)
 
     async def cleanup(self):
         # TODO: move to __aenter__/__aexit__
@@ -308,8 +337,13 @@ class DialogflowCog(commands.Cog):
 
     @commands.command()
     async def youtube_dl(self, ctx, url: str):
-        skill_ctx = voice_bot.users[ctx.author]
+        # TODO: how to get voice channel from text channel???
+        skill_ctx = ctx.bot.voice_bots[ctx.channel].users[ctx.author]
         await registry.run_skill('youtube-dl', skill_ctx, ctx.author, url)
+
+    @commands.command()
+    async def parlai(self, ctx, model: str = 'reddit-2020-07-01'):
+        await registry.run_skill('parlai', )
 
     @join.before_invoke
     async def ensure_voice(self, ctx):
@@ -342,48 +376,55 @@ class DiscordHandler(logging.Handler):
         asyncio.run_coroutine_threadsafe(self.send_message(getattr(record, 'speech', None), self.format(record)), self.loop)
 
 
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), description='Relatively simple music bot example')
-voice_bot = None
+class DiscordFlowBot(commands.bot.BotBase, Client):
+    def __init__(self):
+        super().__init__(command_prefix=commands.when_mentioned_or("!"), description='Bot that can talk with group of people')
+        self.voice_bots = {}
 
+    async def on_ready(self):
+        logger.info(f"Logged in as {self.user}")
+        _load_default()
+        channels = {channel.name: channel for channel in self.get_all_channels()}
+        handler = DiscordHandler(channels['bot-logs'])
+        handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(name)s: %(message)s')
+        handler.setFormatter(formatter)
+        for logger_name in os.getenv('LOGGERS_DISCORD').split(','):
+            logging.getLogger(logger_name).addHandler(handler)
+        logger.debug(f"Guilds: {self.guilds}")
+        for guild in self.guilds:
+            logger.debug(f"{guild.name} channels: {guild.channels}")
+            logger.debug(f"{guild.name} voice channels: {guild.voice_channels}")
+            voice_channel = discord.utils.get(guild.voice_channels)
+            voice_client = await voice_channel.connect()
+            voice_bot = DemultiplexerSink(voice_client, [
+                'view glass',
+                'grasshopper',
+                'blueberry',
+                'jarvis',
+                'bumblebee',
+                'porcupine',
+                'picovoice',
+                'snowboy',
+                'grapefruit',
+                'smart mirror',
+                'alexa',
+                'americano',
+                'computer',
+                'terminator',
+            ])
+            await voice_bot.start()
+            self.voice_bots[voice_channel] = voice_bot
 
-@bot.event
-async def on_ready():
-    logger.info(f"Logged in as {bot.user}")
-    _load_default()
-    channels = {channel.name: channel for channel in bot.get_all_channels()}
-    handler = DiscordHandler(channels['bot-logs'])
-    handler.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(name)s: %(message)s')
-    handler.setFormatter(formatter)
-    for logger_name in os.getenv('LOGGERS_DISCORD').split(','):
-        logging.getLogger(logger_name).addHandler(handler)
-    voice_channel = channels['devs-voice']
-    voice_client = await voice_channel.connect()
-    global voice_bot
-    voice_bot = DemultiplexerSink(voice_client, [
-        'view glass',
-        'grasshopper',
-        'blueberry',
-        'jarvis',
-        'bumblebee',
-        'porcupine',
-        'picovoice',
-        'snowboy',
-        'grapefruit',
-        'smart mirror',
-        'alexa',
-        'americano',
-        'computer',
-        'terminator',
-    ])
-    voice_bot.start()
-    await voice_bot.play(voice_bot.hello)
+    async def on_guild_join(self, guild):
+        logger.debug(f"{self!r} joined {guild}")
 
+    async def on_group_join(self, channel, user):
+        logger.debug(f"{self!r} observed that {user} joined {channel}")
 
-@bot.event
-async def on_voice_state_update(user, old_state, new_state):
-    if user != bot.user and old_state.channel is None and new_state.channel is not None:
-        await voice_bot.on_welcome(user)
+    async def on_voice_state_update(self, user, old_state, new_state):
+        if user != self.user and old_state.channel is None and new_state.channel is not None:
+            await self.voice_bots[new_state.channel].on_welcome(user)
 
 
 def setup_logging():
@@ -398,5 +439,6 @@ def setup_logging():
 def main():
     setup_logging()
     logger.info(f"Loaded skills: {list(registry.skills)}")
+    bot = DiscordFlowBot()
     bot.add_cog(DialogflowCog())
     bot.run(os.getenv('TOKEN'))
