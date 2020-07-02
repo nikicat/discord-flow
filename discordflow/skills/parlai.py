@@ -1,4 +1,4 @@
-from parlai.core.agents import create_agent
+from parlai.core.agents import create_agent, create_agent_from_shared
 from parlai.core.opt import Opt
 from parlai.core.worlds import validate
 
@@ -6,11 +6,19 @@ from ..utils import registry, language
 from ..google import translate
 
 
-@registry.skill()
-async def parlai(bot, userstate, initial=None):
+root_agent = None
+
+
+def initialize():
     opt = Opt.load('opt')
-    agent = create_agent(opt, requireModelExists=True)
+    global root_agent
+    root_agent = create_agent(opt, requireModelExists=True)
+
+
+@registry.skill(init=initialize)
+async def parlai(bot, userstate, initial=None):
     user_text = initial or await bot.listen_text(timeout=10)
+    agent = create_agent_from_shared(root_agent.share())
     while True:
         if language.get() != 'en':
             user_text = await translate(language.get(), 'en', user_text)

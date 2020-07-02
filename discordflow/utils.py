@@ -181,14 +181,22 @@ class Audio:
 class Registry:
     def __init__(self):
         self.skills = {}
+        self.to_init = []
 
-    def skill(self, name=None):
+    def skill(self, name=None, init=None):
         def decorator(func):
             skill_name = name or func.__name__
             self.skills[skill_name] = func
             logger.info(f"Loaded skill '{skill_name}'")
             return func
+        if init:
+            self.to_init.append(init)
         return decorator
+
+    def initialize(self):
+        for func in self.to_init:
+            logger.debug(f"Initializing {func.__module__}")
+            func()
 
     async def run_skill(self, skill, bot, user, *args, **kwargs):
         if skill in self.skills:

@@ -444,6 +444,7 @@ def setup_logging():
 def main():
     setup_logging()
     logger.info(f"Loaded skills: {list(registry.skills)}")
+    registry.initialize()
     bot = DiscordFlowBot()
     bot.add_cog(DialogflowCog())
     bot.run(os.getenv('TOKEN'))

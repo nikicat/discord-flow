@@ -4,6 +4,8 @@ url = "https://pypi.org/simple"
 verify_ssl = true
 
 [dev-packages]
+ipython = "*"
+flake8 = "*"
 
 [packages]
 aiohttp = "<3.7.0,>=3.6.0"
@@ -15,14 +17,21 @@ pydub = "*"
 dialogflow = "*"
 google-search-api = "*"
 google-search-results = "*"
-"discord.py" = {git = "https://github.com/imayhaveborkedit/discord.py"}
 google-cloud-texttospeech = "*"
 google-cloud-speech = "*"
 simpleaudio = "*"
-transformers = "*"
 parlai = "*"
-subword-nmt = {git = "https://github.com/rsennrich/subword-nmt.git"}
 coloredlogs = "*"
+webrtcvad = "*"
+google-cloud = "*"
+google-cloud-translate = "*"
 
 [requires]
 python_version = "3.8"
+
+[packages.subword-nmt]
+git = "https://github.com/rsennrich/subword-nmt.git"
+
+[packages.discord]
+git = "git://github.com/nikicat/discord.py"
+ref = "voice-recv-nb"

@@ -13,7 +13,7 @@
     "batchsize": 1,
     "dynamic_batching": null,
     "model": null,
-    "model_file": "../ParlAI/data/models/blender/blender_90M/model",
+    "model_file": ".venv/lib/python3.8/site-packages/data/models/blender/blender_3B/model",
     "init_model": null,
     "dict_class": "parlai.core.dict:DictionaryAgent",
     "display_examples": false,
