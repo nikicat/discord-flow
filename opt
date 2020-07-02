@@ -13,7 +13,7 @@
     "batchsize": 1,
     "dynamic_batching": null,
     "model": null,
-    "model_file": "./reddit-2020-07-01/model",
+    "model_file": "../ParlAI/data/models/blender/blender_90M/model",
     "init_model": null,
     "dict_class": "parlai.core.dict:DictionaryAgent",
     "display_examples": false,

@@ -13,7 +13,7 @@ from functools import partial
 import simpleaudio
 
 logger = logging.getLogger(__name__)
-language = ContextVar('language', default='en_US')
+language = ContextVar('language', default='ru')
 
 
 class Interrupted(Exception):

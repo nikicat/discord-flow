@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_lang():
-    return language.get().replace('_', '-')
+    return dict(ru='ru-RU', en='en-US')[language.get()]
 
 
 async def request_yandex(url: str, **kwargs):
@@ -37,7 +37,7 @@ async def text_to_speech(text=None, ssml=None) -> Audio:
         kwargs = dict(ssml=ssml)
     data = await request_yandex(
         'https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize',
-        data=dict(format='lpcm', sampleRateHertz=rate, lang=get_lang(), **kwargs),
+        data=dict(format='lpcm', voice='alena', sampleRateHertz=rate, lang=get_lang(), **kwargs),
     )
     return Audio(data=data, channels=1, rate=rate, width=2)
 

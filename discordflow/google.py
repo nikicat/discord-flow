@@ -13,7 +13,7 @@ from dialogflow_v2.types import (
     QueryInput, TextInput, EventInput, InputAudioConfig, QueryParameters, Context, DetectIntentResponse,
 )
 from discord import Member
-from google.cloud import texttospeech, speech_v1p1beta1
+from google.cloud import texttospeech, speech_v1p1beta1, translate_v2
 from google.protobuf.struct_pb2 import Struct
 
 from .utils import sync_to_async, Audio, language, EmptyUtterance
@@ -21,9 +21,13 @@ from .utils import sync_to_async, Audio, language, EmptyUtterance
 logger = logging.getLogger(__name__)
 
 
+def get_lang():
+    return dict(ru='ru_RU', en='en_IN')[language.get()]
+
+
 async def text_to_speech(text) -> Audio:
     voice = texttospeech.VoiceSelectionParams(
-        language_code=language.get(),
+        language_code=get_lang(),
         ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
         name='en-IN-Wavenet-B',
     )
@@ -47,12 +51,12 @@ async def speech_to_text(audio: Audio):
 
     # TODO: replace with AUDIO_ENCODING_OGG_OPUS
     encoding = speech_v1p1beta1.enums.RecognitionConfig.AudioEncoding.LINEAR16
-    config = {
-        "language_code": language.get(),
-        "sample_rate_hertz": audio.rate,
-        "encoding": encoding,
-    }
-    audio = {"content": audio.to_mono().data}
+    config = dict(
+        language_code=get_lang(),
+        sample_rate_hertz=audio.rate,
+        encoding=encoding,
+    )
+    audio = dict(content=audio.to_mono().data)
 
     response = await sync_to_async(client.recognize, config, audio)
     if not response.results:
@@ -106,17 +110,17 @@ async def detect_intent(
     logger.debug(f"Session: {session}")
     kwargs = {}
     if text:
-        query_input = QueryInput(text=TextInput(text=text, language_code=language.get()))
+        query_input = QueryInput(text=TextInput(text=text, language_code=get_lang()))
     elif speech:
         query_input = QueryInput(audio_config=InputAudioConfig(
             audio_encoding=client.enums.AudioEncoding.AUDIO_ENCODING_LINEAR_16,
             sample_rate_hertz=speech.rate,
-            language_code=language.get(),
+            language_code=get_lang(),
             enable_word_info=True,
         ))
         kwargs = dict(input_audio=speech.to_mono().data)
     elif event:
-        query_input = QueryInput(event=EventInput(name=event, parameters=make_parameters(params), language_code=language.get()))
+        query_input = QueryInput(event=EventInput(name=event, parameters=make_parameters(params), language_code=get_lang()))
     else:
         raise ValueError("One of `text`, `speech` or `event` should be set")
 
@@ -147,3 +151,11 @@ async def detect_intent(
     )
     logger.info(f"Detected intent: {intent}")
     return intent
+
+
+async def translate(source: str, target: str, text: str):
+    translate_client = translate_v2.Client()
+    result = await sync_to_async(translate_client.translate, text, source_language=source, target_language=target)
+    translated = result['translatedText']
+    logger.debug(f"Translated: '{text}' -> '{translated}'")
+    return translated

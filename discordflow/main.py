@@ -26,14 +26,14 @@ logger = logging.getLogger(__name__)
 
 
 async def speech_to_text(audio: Audio):
-    if language.get() == 'ru_RU':
+    if language.get() == 'ru':
         return await yandex.speech_to_text(audio)
     else:
         return await google.speech_to_text(audio)
 
 
 async def text_to_speech(text: str):
-    if language.get() == 'ru_RU':
+    if language.get() == 'ru':
         return await yandex.text_to_speech(text)
     else:
         return await google.text_to_speech(text)
@@ -71,7 +71,7 @@ class UserSink:
 
     async def process_wakeup(self):
         try:
-            utterance: Audio = await self.listen_utterance()
+            utterance: Audio = await self.listen_audio()
             with set_contexts():
                 await self.process_utterance(utterance)
         except EmptyUtterance:
@@ -101,12 +101,13 @@ class UserSink:
             except Exception as exc:
                 logger.exception(f"Unexpected exception in {self!r}.listen_loop: {exc}")
 
-    async def listen_utterance(self, timeout=2.3) -> Audio:
+    async def listen_audio(self, timeout=2.3) -> Audio:
         logger.info(f"{self!r} start listening utterance with timeout {timeout}")
         async with background_task(self.play_loop(self.ticktock)):
             sound = Audio(channels=Decoder.CHANNELS, width=2, rate=Decoder.SAMPLING_RATE)
             speech_count = 0
-            speech_threshold = 5
+            speech_threshold = 10
+            self.input_queue = asyncio.Queue()
             while True:
                 try:
                     actual_timeout = 0.4 if speech_count >= speech_threshold else timeout
@@ -114,7 +115,7 @@ class UserSink:
                     sound += packet
                     is_speech = self.vad.is_speech(packet.to_mono().to_rate(16000).data, 16000)
                     logger.debug(f"{self!r} speech packet: is_speech={is_speech} rms={packet.rms}")
-                    if is_speech:
+                    if is_speech and packet.rms > 50:
                         speech_count += 1
                 except asyncio.TimeoutError:
                     logger.info(f"{self!r} stop listening utterance")
@@ -139,7 +140,7 @@ class UserSink:
         if intent.text:
             await self.speak(intent.text)
             if not intent.all_required_params_present:
-                user_answer: Audio = await self.listen_utterance()
+                user_answer: Audio = await self.listen_audio()
                 await self.process_utterance(user_answer)
         if intent.action == 'format':
             answer = intent.text.format(query=query)
@@ -149,6 +150,8 @@ class UserSink:
             await registry.run_skill(skill, self, self.user, **intent.parameters)
         elif intent.action == 'set-language':
             language.set(intent.parameters['lang'])
+        elif intent.action == 'fallback':
+            await registry.run_skill('parlai', self, self.user, initial=intent.query_text)
         elif intent.action:
             logger.warning(f"{self!r} unknown action {intent.action}")
             await self.speak(f"неизвестный экшен: {intent.action}")
@@ -156,7 +159,7 @@ class UserSink:
     async def listen_text(self, timeout=4, tries=1):
         while True:
             try:
-                speech = await self.listen_utterance(timeout=timeout)
+                speech = await self.listen_audio(timeout=timeout)
                 text = await speech_to_text(speech)
                 if not text:
                     raise EmptyUtterance()
@@ -178,7 +181,7 @@ class UserSink:
         await self.play(request)
         while (tries := tries - 1) >= 0:
             try:
-                speech = await self.listen_utterance(timeout=timeout)
+                speech = await self.listen_audio(timeout=timeout)
             except EmptyUtterance:
                 await self.speak("Ну что же ты молчишь?")
             else:
@@ -223,6 +226,7 @@ class DemultiplexerSink(AudioSink):
         self.reader = AudioReader(self, voice_client)
         self.demux_task = BackgroundTask()
         self.attention = asyncio.Lock()
+        self.speak_lock = asyncio.Lock()
 
     def __str__(self):
         return f'channel={self.client.channel}'
@@ -310,9 +314,10 @@ class DemultiplexerSink(AudioSink):
             yield
         else:
             try:
-                await self.client.ws.speak(SpeakingState.active())
-                self.is_speaking = True
-                yield
+                async with self.speak_lock:
+                    await self.client.ws.speak(SpeakingState.active())
+                    self.is_speaking = True
+                    yield
             finally:
                 self.is_speaking = False
                 await self.client.ws.speak(SpeakingState.inactive())
