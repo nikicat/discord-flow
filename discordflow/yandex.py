@@ -1,10 +1,13 @@
+import asyncio
 import json
 import logging
 import os
 
 import aiohttp
-
-from .utils import Audio, language
+from grpclib.client import Channel
+from yandex.cloud.ai.stt.v2.stt_service_pb2 import RecognitionConfig, RecognitionSpec, StreamingRecognitionRequest
+from yandex.cloud.ai.stt.v2.stt_service_grpc import SttServiceStub
+from .utils import Audio, language, TooLongUtterance, background_task
 
 logger = logging.getLogger(__name__)
 
@@ -13,11 +16,15 @@ def get_lang():
     return dict(ru='ru-RU', en='en-US')[language.get()]
 
 
-async def request_yandex(url: str, **kwargs):
+def get_authorization_header():
     api_key = os.getenv('YANDEX_API_KEY')
+    return f'Api-Key {api_key}'
+
+
+async def request_yandex(url: str, **kwargs):
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.post(url, **kwargs, headers=dict(Authorization=f'Api-Key {api_key}')) as response:
+            async with session.post(url, **kwargs, headers=dict(Authorization=get_authorization_header())) as response:
                 body = await response.read()
                 response.raise_for_status()
                 return body
@@ -43,6 +50,8 @@ async def text_to_speech(text=None, ssml=None) -> Audio:
 
 
 async def speech_to_text(speech: Audio):
+    if speech.duration > 10:
+        raise TooLongUtterance
     response = await request_yandex(
         'https://stt.api.cloud.yandex.net/speech/v1/stt:recognize',
         params=dict(format='lpcm', sampleRateHertz=speech.rate, lang=get_lang()),  # TODO: add channels and width
@@ -51,3 +60,47 @@ async def speech_to_text(speech: Audio):
     result = json.loads(response)['result']
     logger.info(f"STT: {result}")
     return result
+
+
+async def read_from_stream(stream):
+    async for reply in stream:
+        for chunk in reply.chunks:
+            logger.debug(f"STT: {'|'.join(alt.text for alt in chunk.alternatives)}. Final={chunk.final}")
+            yield chunk.alternatives
+            if chunk.final:
+                return
+
+
+async def write_to_stream(stream, speech_stream, sent):
+    try:
+        async for speech in speech_stream:
+            speech = speech.to_mono()
+            if not sent.is_set():
+                specification = RecognitionSpec(
+                    language_code=get_lang(),
+                    profanity_filter=False,
+                    model='general',
+                    partial_results=True,
+                    audio_encoding='LINEAR16_PCM',
+                    sample_rate_hertz=speech.rate,
+                )
+                streaming_config = RecognitionConfig(specification=specification)
+                await stream.send_message(StreamingRecognitionRequest(config=streaming_config))
+                sent.set()
+            await stream.send_message(StreamingRecognitionRequest(audio_content=speech.data))
+    finally:
+        await stream.end()
+
+
+async def speech_stream_to_text(speech_stream):
+    channel = Channel('stt.api.cloud.yandex.net', 443, ssl=True)
+    try:
+        stub = SttServiceStub(channel)
+        sent = asyncio.Event()
+        async with stub.StreamingRecognize.open(metadata=[('authorization', get_authorization_header())]) as stream:
+            async with background_task(write_to_stream(stream, speech_stream, sent)):
+                await sent.wait()
+                async for text in read_from_stream(stream):
+                    yield text
+    finally:
+        channel.close()

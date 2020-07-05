@@ -69,7 +69,7 @@ async def cities_skill(bot, user_state: UserState):
                     bot_city = random.choice(cities[bot_letter])
                 except IndexError:
                     user_state.wins += 1
-                    await bot.speak("Сдаюсь, ты выиграл в {user.wins} раз!")
+                    await bot.say("Сдаюсь, ты выиграл в {user.wins} раз!")
                     break
                 seen_cities.add(bot_city)
                 cities[bot_letter].remove(bot_city)
@@ -77,5 +77,5 @@ async def cities_skill(bot, user_state: UserState):
                 question = bot_city
     except Lose as exc:
         user_state.loses += 1
-        await bot.speak(f"{exc}. Ты проиграл в {user_state.loses}-й раз, ха-ха-ха!")
+        await bot.say(f"{exc}. Ты проиграл в {user_state.loses}-й раз, ха-ха-ха!")
     return user_state

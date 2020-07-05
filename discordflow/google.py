@@ -100,9 +100,7 @@ def set_contexts(*contexts):
         contexts_var.reset(token)
 
 
-async def detect_intent(
-    user: Member, text: str = None, speech: Audio = None, event: str = None, params: dict = None,
-) -> Intent:
+async def detect_intent(user: Member, text: str = None, speech: Audio = None, event: str = None, params: dict = None) -> Intent:
     dialogflow_project_id = os.getenv('DIALOGFLOW_PROJECT_ID')
     client = SessionsClient()
     contexts_client = ContextsClient()

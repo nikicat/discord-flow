@@ -133,7 +133,7 @@ async def akinator(bot, userstate):
                         if agreed:
                             resp = await call_choice(sess, session, signature, step['step'], element=choice['id'])
                             times_selected = resp['element_informations']['times_selected']
-                            await bot.speak(f"Я как всегда молодец! Персонаж уже был отыгран {times_selected} раз")
+                            await bot.say(f"Я как всегда молодец! Персонаж уже был отыгран {times_selected} раз")
                             break
                         else:
                             resp = await call_exclusion(sess, session, signature, step['step'])
@@ -141,7 +141,7 @@ async def akinator(bot, userstate):
                             if agreed:
                                 to_speak = step['question']
                             else:
-                                await bot.speak("Спасибо за игру!")
+                                await bot.say("Спасибо за игру!")
                                 break
                     else:
                         to_speak = step['question']

@@ -5,7 +5,9 @@ verify_ssl = true
 
 [dev-packages]
 ipython = "*"
-flake8 = "*"
+flake8 = ">=3.8.3"
+protobuf = "*"
+grpcio-tools = "*"
 
 [packages]
 aiohttp = "<3.7.0,>=3.6.0"
@@ -25,6 +27,7 @@ coloredlogs = "*"
 webrtcvad = "*"
 google-cloud = "*"
 google-cloud-translate = "*"
+grpclib = "*"
 
 [requires]
 python_version = "3.8"

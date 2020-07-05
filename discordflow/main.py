@@ -2,14 +2,15 @@ import asyncio
 import logging
 import logging.handlers
 import os
-from contextlib import suppress, asynccontextmanager
+from contextlib import suppress, asynccontextmanager, contextmanager
+from itertools import accumulate
 from struct import Struct
-from typing import List
+from typing import List, AsyncGenerator, Dict
 
 import webrtcvad
 
 import discord.utils
-from discord import File, SpeakingState, VoiceClient, Client
+from discord import File, SpeakingState, VoiceClient, TextChannel, Guild, User
 from discord.ext import commands
 from discord.opus import Decoder, Encoder, _load_default
 from discord.reader import AudioSink, AudioReader
@@ -19,10 +20,19 @@ from . import yandex, google
 from .google import detect_intent, set_contexts
 from .utils import (
     BackgroundTask, Interrupted, Audio, registry, background_task, EmptyUtterance, rate_limit, size_limit, aiter, language,
+    TooLongUtterance,
 )
 from .skills import *  # noqa to load skills
 
 logger = logging.getLogger(__name__)
+
+
+class ListenMore(Exception):
+    pass
+
+
+class EmptyIntent(Exception):
+    pass
 
 
 async def speech_to_text(audio: Audio):
@@ -39,13 +49,25 @@ async def text_to_speech(text: str):
         return await google.text_to_speech(text)
 
 
-class UserSink:
+async def speech_stream_to_text(speech_stream: AsyncGenerator[Audio, None]):
+    if language.get() == 'ru':
+        async for resp in yandex.speech_stream_to_text(speech_stream):
+            pass
+        return resp[0].text
+    else:
+        # TODO: implement Google streaming STT
+        return await google.speech_to_text(accumulate(packet async for packet in speech_stream))
+
+
+class VoiceUserContext:
     def __init__(self, parent, keywords, user):
         self.parent = parent
         self.user = user
         self.pcp = create(keywords=keywords, sensitivities=[0.5] * len(keywords))
         self.unpacker = Struct(f'{self.pcp.frame_length}h')
-        self.input_queue = asyncio.Queue()
+        self.welcome_response = None
+        self.wuw_input = asyncio.Queue()
+        self.input_queue = self.wuw_input
 
         self.what = parent.what
         self.that = parent.that
@@ -55,14 +77,14 @@ class UserSink:
         self.play_loop = parent.play_loop
         self.play_stream = parent.play_stream
         self.play_interruptible = parent.play_interruptible
-        self.speak = parent.speak
+        self.say = parent.say
         self.vad = webrtcvad.Vad(3)
         self.listen_task = BackgroundTask()
         self.listen_task.start(self.listen_loop())
         logger.info(f"Started {self!r}")
 
     def __repr__(self):
-        return f'{type(self).__name__}<{self.user}>'
+        return f'{type(self).__name__}<{self.parent}:{self.user}>'
 
     def detect_wuw(self, sound: Audio):
         result = self.pcp.process(self.unpacker.unpack(sound.data))
@@ -71,11 +93,19 @@ class UserSink:
 
     async def process_wakeup(self):
         try:
-            utterance: Audio = await self.listen_audio()
+            text = await self.listen_text()
             with set_contexts():
-                await self.process_utterance(utterance)
+                while True:
+                    try:
+                        await self.process_intent(text)
+                    except ListenMore:
+                        logger.debug("Intent wants more info, listening again")
+                    else:
+                        break
+        except TooLongUtterance:
+            await self.say("Скажи покороче")
         except EmptyUtterance:
-            await self.speak("В следующий раз я тоже тебе не отвечу!")
+            await self.say("В следующий раз я тоже тебе не отвечу!")
         except Interrupted:
             logger.info(f"{self!r} interrupted")
 
@@ -83,7 +113,7 @@ class UserSink:
         """Listen for wake up word and return it"""
         sound = Audio(rate=self.pcp.sample_rate, channels=1, width=2)
         while True:
-            sound += (await self.listen()).to_mono().to_rate(self.pcp.sample_rate)
+            sound += (await self.wuw_input.get()).to_mono().to_rate(self.pcp.sample_rate)
             while len(sound) >= self.pcp.frame_length:
                 to_process = sound[:self.pcp.frame_length]
                 sound = sound[self.pcp.frame_length:]
@@ -102,74 +132,94 @@ class UserSink:
                 logger.exception(f"Unexpected exception in {self!r}.listen_loop: {exc}")
 
     async def listen_audio(self, timeout=2.3) -> Audio:
+        speech = Audio(channels=Decoder.CHANNELS, width=2, rate=Decoder.SAMPLING_RATE)
+        async for packet in self.listen_audio_stream(timeout=timeout):
+            speech += packet
+        return speech
+
+    @contextmanager
+    def listening_utterance(self):
+        try:
+            self.input_queue = asyncio.Queue()
+            yield self.input_queue
+        finally:
+            self.input_queue = self.wuw_input
+
+    async def listen_audio_stream(self, timeout=2.3) -> AsyncGenerator[Audio, None]:
         logger.info(f"{self!r} start listening utterance with timeout {timeout}")
         async with background_task(self.play_loop(self.ticktock)):
             sound = Audio(channels=Decoder.CHANNELS, width=2, rate=Decoder.SAMPLING_RATE)
             speech_count = 0
             speech_threshold = 10
-            self.input_queue = asyncio.Queue()
-            while True:
-                try:
-                    actual_timeout = 0.4 if speech_count >= speech_threshold else timeout
-                    packet = await asyncio.wait_for(self.listen(), timeout=actual_timeout)
-                    sound += packet
-                    is_speech = self.vad.is_speech(packet.to_mono().to_rate(16000).data, 16000)
-                    logger.debug(f"{self!r} speech packet: is_speech={is_speech} rms={packet.rms}")
-                    if is_speech and packet.rms > 50:
-                        speech_count += 1
-                except asyncio.TimeoutError:
-                    logger.info(f"{self!r} stop listening utterance")
-                    if len(sound) == 0:
-                        raise EmptyUtterance()
-                    logger.info(f"{self!r} listened speech: {sound.duration}s", extra=dict(speech=sound))
-                    return sound
+            with self.listening_utterance() as queue:
+                while True:
+                    try:
+                        actual_timeout = 0.4 if speech_count >= speech_threshold else timeout
+                        packet = await asyncio.wait_for(queue.get(), timeout=actual_timeout)
+                        yield packet
+                        sound += packet
+                        logger.debug(f"{self!r} speech packet: rms={packet.rms}")
+                        if packet.rms > 50:
+                            speech_count += 1
+                    except asyncio.TimeoutError:
+                        if not sound:
+                            logger.info(f"{self!r} speech was empty")
+                            raise EmptyUtterance
+                        logger.info(f"{self!r} listened speech: {sound.duration}s", extra=dict(speech=sound))
+                        break
 
-    async def listen(self) -> Audio:
-        return await self.input_queue.get()
+    async def listen_text(self, timeout=4, tries=1):
+        while True:
+            try:
+                speech_stream = self.listen_audio_stream(timeout=timeout)
+                text = await speech_stream_to_text(speech_stream)
+                if not text:
+                    raise EmptyUtterance
+                return text
+            except EmptyUtterance:
+                tries -= 1
+                if tries:
+                    await self.say("Ну то же ты молчишь?")
+                else:
+                    raise
 
     async def feed(self, audio: Audio):
         self.input_queue.put_nowait(audio)
         logger.debug(f'feed: {self!r}. qsize={self.input_queue.qsize()}')
 
-    async def process_utterance(self, utterance: Audio):
-        text = await speech_to_text(utterance)
-        if not text:
-            raise EmptyUtterance()
-        intent = await detect_intent(self.user, text)
+    async def process_intent(self, text: str = None, speech: Audio = None, event: str = None, params: dict = None):
+        intent = await detect_intent(self.user, text=text, speech=speech, event=event, params=params)
         query = intent.parameters.get('query', text)
-        if intent.text:
-            await self.speak(intent.text)
-            if not intent.all_required_params_present:
-                user_answer: Audio = await self.listen_audio()
-                await self.process_utterance(user_answer)
-        if intent.action == 'format':
+        if not intent.all_required_params_present:
+            await self.say(intent.text)
+            raise ListenMore
+        elif intent.action == 'format':
             answer = intent.text.format(query=query)
-            await self.speak(answer)
+            await self.say(answer)
         elif intent.action.startswith('skill.'):
             skill = intent.action.split('skill.')[-1]
-            await registry.run_skill(skill, self, self.user, **intent.parameters)
+            await registry.run_skill(skill, self, **intent.parameters)
         elif intent.action == 'set-language':
             language.set(intent.parameters['lang'])
         elif intent.action == 'fallback':
-            await registry.run_skill('parlai', self, self.user, initial=intent.query_text)
+            await registry.run_skill('parlai', self, initial=intent.query_text)
+        elif intent.action == 'responses':
+            responses = [
+                f"{user.nick or user.name} говорит, что {ctx.welcome_response}" for user, ctx in self.parent.users.items()
+                if ctx.welcome_response
+            ]
+            if responses:
+                text = ". ".join(responses)
+            else:
+                text = "Пока новостей нет"
+            await self.say(text)
         elif intent.action:
             logger.warning(f"{self!r} unknown action {intent.action}")
-            await self.speak(f"неизвестный экшен: {intent.action}")
-
-    async def listen_text(self, timeout=4, tries=1):
-        while True:
-            try:
-                speech = await self.listen_audio(timeout=timeout)
-                text = await speech_to_text(speech)
-                if not text:
-                    raise EmptyUtterance()
-                return text
-            except EmptyUtterance:
-                tries -= 1
-                if tries:
-                    await self.speak("Ну что же ты молчишь?")
-                else:
-                    raise
+            await self.say(f"неизвестный экшен: {intent.action}")
+        elif intent.text:
+            await self.say(intent.text)
+        else:
+            raise EmptyIntent
 
     async def ask(self, question, timeout=4, tries=1):
         request = await text_to_speech(text=question)
@@ -177,20 +227,19 @@ class UserSink:
         return await self.listen_text(timeout, tries)
 
     async def ask_and_detect_intent(self, question, timeout=4, tries=3):
-        request = await text_to_speech(text=question)
-        await self.play(request)
+        await self.say(question)
         while (tries := tries - 1) >= 0:
             try:
                 speech = await self.listen_audio(timeout=timeout)
             except EmptyUtterance:
-                await self.speak("Ну что же ты молчишь?")
+                await self.say("Ну что же ты молчишь?")
             else:
                 intent = await detect_intent(self.user, speech=speech)
                 if intent.action == 'repeat':
-                    await self.play(request)
+                    await self.say(question)
                     tries += 1
                 elif intent.action == 'fallback':
-                    await self.speak(intent.text)
+                    await self.say(intent.text)
                 else:
                     return intent
         else:
@@ -206,16 +255,37 @@ class UserSink:
 
     async def on_welcome(self):
         logger.info(f"Welcome {self.user}")
-        intent = await detect_intent(self.user, event='WELCOME', params=dict(name=self.user.name))
-        if intent.text:
-            await self.speak(intent.text)
+        name = self.user.nick or self.user.name
+        if not self.welcome_response:
+            last_welcomed_user = self.parent.last_welcomed_user
+            if last_welcomed_user:
+                last_name = last_welcomed_user.nick or last_welcomed_user.name
+                last_response = self.parent.user[last_welcomed_user].welcome_response
+                text = f"Привет, {name}! {last_name} сказал, что {last_response}. А у тебя какие новости?"
+            else:
+                text = f"Привет, {name}! Что нового?"
+            self.welcome_response = await self.ask(text)
+        self.parent.last_welcomed_user = self.user
 
 
-class DemultiplexerSink(AudioSink):
+class TextUserContext:
+    def __init__(self, channel: TextChannel, user):
+        self.channel = channel
+        self.user = user
+
+    async def say(self, text: str):
+        await self.channel.send(text)
+
+    async def ask(self, text: str) -> str:
+        await self.say(text)
+        await self.client.wait_for('message', lambda m: m.channel == self.channel and m.author == self.user)
+
+
+class ChannelVoiceContext(AudioSink):
     def __init__(self, voice_client: VoiceClient, keywords: List[str]):
         self.client = voice_client
         self.keywords = keywords
-        self.users = {}
+        self.users: Dict[User, VoiceUserContext] = {}
         self.deleted = False
         self.is_speaking = False
         self.what = Audio.load('what2.wav')
@@ -227,9 +297,10 @@ class DemultiplexerSink(AudioSink):
         self.demux_task = BackgroundTask()
         self.attention = asyncio.Lock()
         self.speak_lock = asyncio.Lock()
+        self.last_welcomed_user = None
 
     def __str__(self):
-        return f'channel={self.client.channel}'
+        return f'guild={self.client.guild}'
 
     def __repr__(self):
         return f'<{type(self).__name__}>[{self}]'
@@ -259,7 +330,7 @@ class DemultiplexerSink(AudioSink):
 
     def get_user_sink(self, user):
         if user not in self.users:
-            self.users[user] = UserSink(self, self.keywords, user)
+            self.users[user] = VoiceUserContext(self, self.keywords, user)
         return self.users[user]
 
     async def play_stream(self, stream):
@@ -303,7 +374,7 @@ class DemultiplexerSink(AudioSink):
     async def play_interruptible(self, audio: Audio):
         return await self.run_interruptible(self.play(audio))
 
-    async def speak(self, text):
+    async def say(self, text):
         logger.debug(f"Speaking: {text}")
         audio = await text_to_speech(text=text)
         await self.play_interruptible(audio)
@@ -327,82 +398,64 @@ class DemultiplexerSink(AudioSink):
 
 
 class DialogflowCog(commands.Cog):
-    @commands.command()
-    async def join(self, ctx):
-        """Joins a voice channel"""
+    def __init__(self, bot):
+        self.bot = bot
+        self.voice_bots: Dict[Guild, ChannelVoiceContext] = {}
+        self.text_contexts = {}
 
+    def get_text_context(self, ctx):
+        key = (ctx.channel, ctx.author)
+        if key not in self.text_contexts:
+            self.text_contexts[key] = TextUserContext(ctx.channel, ctx.author)
+        return self.text_contexts[key]
+
+    @commands.command()
+    async def voice(self, ctx):
+        """Joins a voice channel"""
         if ctx.voice_client.channel != ctx.author.voice.channel:
             return await ctx.voice_client.move_to(ctx.author.voice.channel)
 
     @commands.command()
-    async def stop(self, ctx):
-        """Stops and disconnects the bot from voice"""
-
-        await ctx.voice_client.disconnect()
-
-    @commands.command()
     async def youtube_dl(self, ctx, url: str):
         # TODO: how to get voice channel from text channel???
-        skill_ctx = ctx.bot.voice_bots[ctx.channel].users[ctx.author]
-        await registry.run_skill('youtube-dl', skill_ctx, ctx.author, url)
+        skill_ctx = ctx.bot.voice_bots[ctx.guild].users[ctx.author]
+        await registry.run_skill('youtube-dl', skill_ctx, url)
 
     @commands.command()
-    async def parlai(self, ctx, model: str = 'reddit-2020-07-01'):
-        await registry.run_skill('parlai', )
+    async def parlai(self, ctx, initial: str = None):
+        skill_ctx = self.get_text_context(ctx)
+        await registry.run_skill('parlai', skill_ctx, initial)
 
-    @join.before_invoke
-    async def ensure_voice(self, ctx):
-        if ctx.voice_client is None:
-            if ctx.author.voice:
-                logger.debug(f'Joining channel {ctx.author.voice.channel!r}')
-                await ctx.author.voice.channel.connect()
-            else:
-                await ctx.send("You are not connected to a voice channel.")
-                raise commands.CommandError("Author not connected to a voice channel.")
-        elif ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
+    @commands.command()
+    async def search(self, ctx, query):
+        skill_ctx = self.get_text_context(ctx)
+        await registry.run_skill('duckduckgo', skill_ctx, query)
 
+    @commands.command()
+    async def responses(self, ctx):
+        bot = self.voice_bots[ctx.guild]
+        responses = [f" - {user}: {ctx.welcome_response} " for user, ctx in bot.users.items() if ctx.welcome_response]
+        await ctx.send("\n".join(responses))
 
-@registry.skill('quest')
-async def dfrotz_skill(bot, parameters):
-    await bot.speak("стартую скиллуху")
-
-
-class DiscordHandler(logging.Handler):
-    def __init__(self, channel):
-        super().__init__()
-        self.channel = channel
-        self.loop = asyncio.get_running_loop()
-
-    async def send_message(self, speech: Audio, message: str):
-        await self.channel.send(f'```{message}```', file=speech and File(fp=speech.to_wav(), filename='speech.wav'))
-
-    def emit(self, record: logging.LogRecord):
-        asyncio.run_coroutine_threadsafe(self.send_message(getattr(record, 'speech', None), self.format(record)), self.loop)
-
-
-class DiscordFlowBot(commands.bot.BotBase, Client):
-    def __init__(self):
-        super().__init__(command_prefix=commands.when_mentioned_or("!"), description='Bot that can talk with group of people')
-        self.voice_bots = {}
-
+    @commands.Cog.listener()
     async def on_ready(self):
-        logger.info(f"Logged in as {self.user}")
+        logger.info(f"Logged in as {self.bot.user}")
         _load_default()
-        channels = {channel.name: channel for channel in self.get_all_channels()}
+        channels = {channel.name: channel for channel in self.bot.get_all_channels()}
         handler = DiscordHandler(channels['bot-logs'])
         handler.setLevel(logging.INFO)
         formatter = logging.Formatter('%(name)s: %(message)s')
         handler.setFormatter(formatter)
         for logger_name in os.getenv('LOGGERS_DISCORD').split(','):
             logging.getLogger(logger_name).addHandler(handler)
-        logger.debug(f"Guilds: {self.guilds}")
-        for guild in self.guilds:
+        logger.debug(f"Guilds: {self.bot.guilds}")
+        for guild in self.bot.guilds:
             logger.debug(f"{guild.name} channels: {guild.channels}")
             logger.debug(f"{guild.name} voice channels: {guild.voice_channels}")
+            # TODO: save and use last voice channel
             voice_channel = discord.utils.get(guild.voice_channels)
             voice_client = await voice_channel.connect()
-            voice_bot = DemultiplexerSink(voice_client, [
+            voice_bot = ChannelVoiceContext(voice_client, [
                 'view glass',
                 'grasshopper',
                 'blueberry',
@@ -419,22 +472,39 @@ class DiscordFlowBot(commands.bot.BotBase, Client):
                 'terminator',
             ])
             await voice_bot.start()
-            self.voice_bots[voice_channel] = voice_bot
+            self.voice_bots[guild] = voice_bot
 
+    @commands.Cog.listener()
     async def on_guild_join(self, guild):
         logger.debug(f"{self!r} joined {guild}")
 
+    @commands.Cog.listener()
     async def on_group_join(self, channel, user):
         logger.debug(f"{self!r} observed that {user} joined {channel}")
 
+    @commands.Cog.listener()
     async def on_voice_state_update(self, user, old_state, new_state):
-        if user != self.user and old_state.channel is None and new_state.channel is not None:
-            await self.voice_bots[new_state.channel].on_welcome(user)
+        if user != self.bot.user and old_state.channel is None and new_state.channel is not None:
+            await asyncio.sleep(0.4)  # Wait while user voice connection is established
+            await self.voice_bots[new_state.channel.guild].on_welcome(user)
+
+
+class DiscordHandler(logging.Handler):
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel
+        self.loop = asyncio.get_running_loop()
+
+    async def send_message(self, speech: Audio, message: str):
+        await self.channel.send(f'```{message}```', file=speech and File(fp=speech.to_wav(), filename='speech.wav'))
+
+    def emit(self, record: logging.LogRecord):
+        asyncio.run_coroutine_threadsafe(self.send_message(getattr(record, 'speech', None), self.format(record)), self.loop)
 
 
 def setup_logging():
     logging.basicConfig(level=logging.INFO, format='%(asctime)-15s %(levelname)s[%(name)-20s] %(message)s')
-    logging.getLogger('discord.gateway').setLevel(logging.WARNING)
+    logging.getLogger('discord.gateway').setLevel(logging.ERROR)  # Too noisy
     for level, name in logging._levelToName.items():
         for logger_name in os.getenv(f'LOGGERS_{name}', '').split(','):
             if logger_name:
@@ -444,7 +514,15 @@ def setup_logging():
 def main():
     setup_logging()
     logger.info(f"Loaded skills: {list(registry.skills)}")
-    registry.initialize()
-    bot = DiscordFlowBot()
-    bot.add_cog(DialogflowCog())
-    bot.run(os.getenv('TOKEN'))
+    asyncio.run(amain())
+
+
+async def amain():
+    bot = commands.bot.Bot(command_prefix=commands.when_mentioned_or("!"), description="Bot that can talk with group of people")
+    bot.add_cog(DialogflowCog(bot))
+    try:
+        await bot.start(os.getenv('TOKEN'))
+    finally:
+        for task in asyncio.all_tasks():
+            task.print_stack()
+        await bot.close()

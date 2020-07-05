@@ -4,6 +4,7 @@ import io
 import logging
 import pickle
 import time
+import unicodedata
 import wave
 from contextlib import suppress, asynccontextmanager
 from contextvars import ContextVar
@@ -16,11 +17,20 @@ logger = logging.getLogger(__name__)
 language = ContextVar('language', default='ru')
 
 
+def _(s):
+    # TODO: here should be localization
+    return s
+
+
 class Interrupted(Exception):
     pass
 
 
 class EmptyUtterance(Exception):
+    pass
+
+
+class TooLongUtterance(Exception):
     pass
 
 
@@ -181,7 +191,7 @@ class Audio:
 class Registry:
     def __init__(self):
         self.skills = {}
-        self.to_init = []
+        self.initializers = {}
 
     def skill(self, name=None, init=None):
         def decorator(func):
@@ -190,36 +200,42 @@ class Registry:
             logger.info(f"Loaded skill '{skill_name}'")
             return func
         if init:
-            self.to_init.append(init)
+            self.initializers[name] = init
         return decorator
 
-    def initialize(self):
-        for func in self.to_init:
-            logger.debug(f"Initializing {func.__module__}")
-            func()
+    def initialize_skills(self):
+        for skill in list(self.initializers):
+            self.initialize(skill)
 
-    async def run_skill(self, skill, bot, user, *args, **kwargs):
+    def initialize(self, skill: str):
+        logger.debug(f"Initializing {skill}")
+        self.initializers[skill]()
+        del self.initializers[skill]
+
+    async def run_skill(self, skill: str, ctx, *args, **kwargs):
         if skill in self.skills:
+            if skill in self.initializers:
+                self.initialize(skill)
             try:
-                state = self.load_state(skill, user)
+                state = self.load_state(skill, ctx)
             except Exception as exc:
-                logger.debug(f"Cant load state for {skill}.{user} due to {exc}")
+                logger.debug(f"Cant load state for {skill}.{ctx} due to {exc}")
                 state = None
-            state = await self.skills[skill](bot, state, *args, **kwargs)
+            state = await self.skills[skill](ctx, state, *args, **kwargs)
             if state:
-                self.save_state(skill, user, state)
+                self.save_state(skill, ctx, state)
         else:
-            await bot.speak("такого я не умею")
+            await ctx.say("такого я не умею")
 
-    def get_state_path(self, skill: str, user: str):
-        return f'skill-states/{skill}.{user}.pickle'
+    def get_state_path(self, skill: str, ctx):
+        return f'skill-states/{skill}.{ctx.channel.id}.{ctx.user.name}.pickle'
 
-    def load_state(self, skill: str, user: str):
-        with open(self.get_state_path(skill, user), 'rb') as f:
+    def load_state(self, skill: str, ctx):
+        with open(self.get_state_path(skill, ctx), 'rb') as f:
             return pickle.load(f)
 
-    def save_state(self, skill: str, user: str, state):
-        with open(self.get_state_path(skill, user), 'wb') as f:
+    def save_state(self, skill: str, ctx, state):
+        with open(self.get_state_path(skill, ctx), 'wb') as f:
             return pickle.dump(state, f)
 
 
@@ -251,3 +267,7 @@ async def rate_limit(audio_iter):
         await asyncio.sleep(to_sleep)
     if packet:
         yield packet
+
+
+def strip_accents(s: str):
+    return ''.join(c for c in s if unicodedata.category(c) != 'Mn')
