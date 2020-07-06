@@ -7,8 +7,6 @@ from itertools import accumulate
 from struct import Struct
 from typing import List, AsyncGenerator, Dict
 
-import webrtcvad
-
 import discord.utils
 from discord import File, SpeakingState, VoiceClient, TextChannel, Guild, User
 from discord.ext import commands
@@ -78,7 +76,6 @@ class VoiceUserContext:
         self.play_stream = parent.play_stream
         self.play_interruptible = parent.play_interruptible
         self.say = parent.say
-        self.vad = webrtcvad.Vad(3)
         self.listen_task = BackgroundTask()
         self.listen_task.start(self.listen_loop())
         logger.info(f"Started {self!r}")
@@ -93,17 +90,19 @@ class VoiceUserContext:
 
     async def process_wakeup(self):
         try:
-            text = await self.listen_text()
             with set_contexts():
                 while True:
+                    try:
+                        text = await self.listen_text()
+                    except TooLongUtterance:
+                        await self.say("Скажи покороче")
+                        continue
                     try:
                         await self.process_intent(text)
                     except ListenMore:
                         logger.debug("Intent wants more info, listening again")
                     else:
                         break
-        except TooLongUtterance:
-            await self.say("Скажи покороче")
         except EmptyUtterance:
             await self.say("В следующий раз я тоже тебе не отвечу!")
         except Interrupted:
@@ -503,7 +502,7 @@ class DiscordHandler(logging.Handler):
 
 
 def setup_logging():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)-15s %(levelname)s[%(name)-20s] %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)-15s %(levelname)-5s[%(name)-30s:%(lineno)d] %(message)s')
     logging.getLogger('discord.gateway').setLevel(logging.ERROR)  # Too noisy
     for level, name in logging._levelToName.items():
         for logger_name in os.getenv(f'LOGGERS_{name}', '').split(','):
@@ -518,7 +517,7 @@ def main():
 
 
 async def amain():
-    bot = commands.bot.Bot(command_prefix=commands.when_mentioned_or("!"), description="Bot that can talk with group of people")
+    bot = commands.bot.Bot(command_prefix=commands.when_mentioned_or('!'), description="Bot that can talk with group of people")
     bot.add_cog(DialogflowCog(bot))
     try:
         await bot.start(os.getenv('TOKEN'))

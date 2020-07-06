@@ -15,22 +15,14 @@ websockets = ">=6.0,!=8.0,!=7.0,!=8.0.1,<9.0"
 youtube-dl = "*"
 pynacl = "*"
 pvporcupine = "*"
-pydub = "*"
-dialogflow = "*"
-google-search-api = "*"
-google-search-results = "*"
-google-cloud-texttospeech = "*"
-google-cloud-speech = "*"
 simpleaudio = "*"
 parlai = "*"
 coloredlogs = "*"
-webrtcvad = "*"
-google-cloud = "*"
-google-cloud-translate = "*"
 grpclib = "*"
 
-[requires]
-python_version = "3.8"
+[packages.google-auth]
+git = "git://github.com/tan01/google-auth-library-python"
+ref = "user/tan01/feature/asyncio_aiohttp_support"
 
 [packages.subword-nmt]
 git = "https://github.com/rsennrich/subword-nmt.git"
@@ -38,3 +30,6 @@ git = "https://github.com/rsennrich/subword-nmt.git"
 [packages.discord]
 git = "git://github.com/nikicat/discord.py"
 ref = "voice-recv-nb"
+
+[requires]
+python_version = "3.8"

@@ -38,16 +38,26 @@ class BackgroundTask:
     def __init__(self):
         self.task = None
 
+    async def wrap(self, coro):
+        try:
+            await coro
+        except Exception as exc:
+            logger.exception(f"Unexpected exception in {coro}: {exc!r}")
+            raise
+
     def start(self, coro):
         if self.task is not None:
             raise RuntimeError("{self!r} is already running")
-        self.task = asyncio.create_task(coro)
+        self.task = asyncio.create_task(self.wrap(coro))
 
     async def stop(self):
-        self.task.cancel()
-        with suppress(asyncio.CancelledError):
-            await self.task
-        self.task = None
+        task, self.task = self.task, None
+        if task.done():
+            return task.result()
+        else:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 @asynccontextmanager

@@ -7,7 +7,7 @@ import aiohttp
 from grpclib.client import Channel
 from yandex.cloud.ai.stt.v2.stt_service_pb2 import RecognitionConfig, RecognitionSpec, StreamingRecognitionRequest
 from yandex.cloud.ai.stt.v2.stt_service_grpc import SttServiceStub
-from .utils import Audio, language, TooLongUtterance, background_task
+from .utils import Audio, language, TooLongUtterance, background_task, EmptyUtterance
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,8 @@ async def read_from_stream(stream):
             yield chunk.alternatives
             if chunk.final:
                 return
+    else:
+        raise EmptyUtterance
 
 
 async def write_to_stream(stream, speech_stream, sent):

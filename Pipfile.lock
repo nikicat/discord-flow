@@ -1,7 +1,7 @@
 {
     "_meta": {
         "hash": {
-            "sha256": "3e1421014119376f55ffb3a772364875d0d06e8ef92e1669b07ad1d92ca5d328"
+            "sha256": "a084462657a7c53f52b92a0bbf8de85c5314a5c960ecd422e697a19805c42cdd"
         },
         "pipfile-spec": 6,
         "requires": {
@@ -19,6 +19,10 @@
         "discord": {
             "git": "git://github.com/nikicat/discord.py",
             "ref": "voice-recv-nb"
+        },
+        "google-auth": {
+            "git": "git://github.com/tan01/google-auth-library-python",
+            "ref": "user/tan01/feature/asyncio_aiohttp_support"
         },
         "subword-nmt": {
             "git": "https://github.com/rsennrich/subword-nmt.git"
