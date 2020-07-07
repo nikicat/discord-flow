@@ -7,6 +7,5 @@ python -m grpc_tools.protoc -I../googleapis --python_out=. --grpclib_python_out=
     google/cloud/translate/v3/translation_service.proto \
     google/cloud/dialogflow/v2/{audio_config,context,entity_type,environment,intent,session_entity_type,session,validation_result,webhook}.proto \
     google/longrunning/operations.proto \
-    google/protobuf/duration.proto \
     google/rpc/status.proto \
     google/type/latlng.proto

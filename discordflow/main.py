@@ -259,7 +259,7 @@ class VoiceUserContext:
             last_welcomed_user = self.parent.last_welcomed_user
             if last_welcomed_user:
                 last_name = last_welcomed_user.nick or last_welcomed_user.name
-                last_response = self.parent.user[last_welcomed_user].welcome_response
+                last_response = self.parent.users[last_welcomed_user].welcome_response
                 text = f"Привет, {name}! {last_name} сказал, что {last_response}. А у тебя какие новости?"
             else:
                 text = f"Привет, {name}! Что нового?"

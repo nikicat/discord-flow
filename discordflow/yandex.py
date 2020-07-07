@@ -2,11 +2,14 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import suppress
 
 import aiohttp
 from grpclib.client import Channel
+from grpclib.exceptions import ProtocolError
 from yandex.cloud.ai.stt.v2.stt_service_pb2 import RecognitionConfig, RecognitionSpec, StreamingRecognitionRequest
 from yandex.cloud.ai.stt.v2.stt_service_grpc import SttServiceStub
+
 from .utils import Audio, language, TooLongUtterance, background_task, EmptyUtterance
 
 logger = logging.getLogger(__name__)
@@ -91,7 +94,8 @@ async def write_to_stream(stream, speech_stream, sent):
                 sent.set()
             await stream.send_message(StreamingRecognitionRequest(audio_content=speech.data))
     finally:
-        await stream.end()
+        with suppress(ProtocolError):
+            await stream.end()
 
 
 async def speech_stream_to_text(speech_stream):

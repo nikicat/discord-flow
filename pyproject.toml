@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "discord-flow"
+version = "0.1.0"
+description = ""
+authors = ["Nikolay Bryskin <nb@gosu.ai>"]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+google-auth = {git = "https://github.com/tan01/google-auth-library-python", rev = "user/tan01/feature/asyncio_aiohttp_support"}
+subword-nmt = {git = "https://github.com/rsennrich/subword-nmt"}
+"discord.py" = {git = "https://github.com/nikicat/discord.py", rev = "voice-recv-nb"}
+aiohttp = "^3.6.2"
+websockets = "^8.1"
+youtube-dl = "^2020.6.16"
+pynacl = "^1.4.0"
+pvporcupine = "^1.8.1"
+simpleaudio = "^1.0.4"
+parlai = "^0.1.20200610"
+coloredlogs = "^14.0"
+grpclib = "^0.3.2"
+protobuf = "^3.12.2"
+
+[tool.poetry.dev-dependencies]
+ipython = "^7.16.1"
+grpcio-tools = "^1.30.0"
+
+[build-system]
+requires = ["poetry>=0.12"]
+build-backend = "poetry.masonry.api"
