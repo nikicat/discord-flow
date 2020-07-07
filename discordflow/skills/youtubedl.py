@@ -67,5 +67,5 @@ async def youtubedl(ctx, state, url):
 
 
 @registry.skill()
-async def youtubedl_ytsearch(ctx, state, query):
-    return await youtubedl(ctx, state, f'ytsearch:{query}')
+async def youtubedl_ytsearch(ctx, state, query, prefix=''):
+    return await youtubedl(ctx, state, f'ytsearch:{prefix} {query}')

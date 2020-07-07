@@ -1,7 +1,7 @@
 import logging
 import os
 
-from serpapi.google_search_results import GoogleSearchResults
+#from serpapi.google_search_results import GoogleSearchResults
 
 from ..utils import sync_to_async, registry
 
