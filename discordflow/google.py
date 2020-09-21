@@ -15,7 +15,7 @@ from discord import Member
 from google.auth.transport.aio.aiohttp import Request
 from google.oauth2.aio.service_account import Credentials
 
-from google.cloud.dialogflow.v2.audio_config_pb2 import InputAudioConfig
+from google.cloud.dialogflow.v2.audio_config_pb2 import InputAudioConfig, AudioEncoding
 from google.cloud.dialogflow.v2.context_pb2 import Context
 from google.cloud.dialogflow.v2.session_grpc import SessionsStub
 from google.cloud.dialogflow.v2.session_pb2 import (
@@ -47,7 +47,7 @@ LINEAR16 = 1  # FIXME
 
 
 def get_lang():
-    return dict(ru='ru_RU', en='en_IN')[language.get()]
+    return dict(ru='ru-RU', en='en-IN')[language.get()]
 
 
 async def text_to_speech(text) -> Audio:
@@ -135,7 +135,7 @@ async def detect_intent(user: Member, text: str = None, speech: Audio = None, ev
             query_input = QueryInput(text=TextInput(text=text, language_code=get_lang()))
         elif speech:
             query_input = QueryInput(audio_config=InputAudioConfig(
-                audio_encoding=client.enums.AudioEncoding.AUDIO_ENCODING_LINEAR_16,
+                audio_encoding=AudioEncoding.Value('AUDIO_ENCODING_LINEAR_16'),
                 sample_rate_hertz=speech.rate,
                 language_code=get_lang(),
                 enable_word_info=True,
