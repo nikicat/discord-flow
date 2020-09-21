@@ -281,3 +281,11 @@ async def rate_limit(audio_iter):
 
 def strip_accents(s: str):
     return ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+
+
+@asynccontextmanager
+async def aclosing(generator):
+    try:
+        yield generator
+    finally:
+        await generator.aclose()

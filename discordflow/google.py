@@ -1,4 +1,5 @@
 import asyncio
+import html
 import importlib
 import logging
 import os
@@ -187,7 +188,7 @@ async def translate(source: str, target: str, text: str):
             parent=f'projects/{get_credentials().project_id}',
         )
         response: TranslateTextResponse = await client.TranslateText(request, metadata=await get_metadata())
-        result = response.translations[0].translated_text
+        result = html.unescape(response.translations[0].translated_text)
         logger.debug(f"Translated: '{text}' -> '{result}'")
         return result
 

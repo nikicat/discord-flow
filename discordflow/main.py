@@ -7,6 +7,7 @@ from itertools import accumulate
 from struct import Struct
 from typing import List, AsyncGenerator, Dict
 
+import async_timeout_pre
 import discord.utils
 from discord import File, SpeakingState, VoiceClient, TextChannel, Guild, User
 from discord.ext import commands
@@ -18,11 +19,12 @@ from . import yandex, google
 from .google import detect_intent, set_contexts
 from .utils import (
     BackgroundTask, Interrupted, Audio, registry, background_task, EmptyUtterance, rate_limit, size_limit, aiter, language,
-    TooLongUtterance,
+    TooLongUtterance, aclosing,
 )
 from .skills import *  # noqa to load skills
 
 logger = logging.getLogger(__name__)
+logger_trace = logging.getLogger('discordflow.trace')
 
 
 class ListenMore(Exception):
@@ -55,6 +57,23 @@ async def speech_stream_to_text(speech_stream: AsyncGenerator[Audio, None]):
     else:
         # TODO: implement Google streaming STT
         return await google.speech_to_text(accumulate(packet async for packet in speech_stream))
+
+
+async def listen_stream_until_got_text(speech_stream: AsyncGenerator[Audio, None], timeout: float):
+    if language.get() == 'ru':
+        try:
+            resp = None
+            async with aclosing(yandex.speech_stream_to_text(speech_stream)) as text_stream:
+                async with async_timeout_pre.timeout(timeout) as timeout_cm:
+                    async for resp in text_stream:
+                        timeout_cm.shift_by(0.4)
+        except asyncio.TimeoutError as exc:
+            if resp:
+                return resp[0].text
+            else:
+                raise EmptyUtterance from exc
+    else:
+        raise NotImplementedError
 
 
 class VoiceUserContext:
@@ -131,10 +150,27 @@ class VoiceUserContext:
                 logger.exception(f"Unexpected exception in {self!r}.listen_loop: {exc}")
 
     async def listen_audio(self, timeout=2.3) -> Audio:
-        speech = Audio(channels=Decoder.CHANNELS, width=2, rate=Decoder.SAMPLING_RATE)
-        async for packet in self.listen_audio_stream(timeout=timeout):
-            speech += packet
-        return speech
+        logger.info(f"{self!r} start listening audio with timeout {timeout}")
+        async with aclosing(self.listen_audio_stream()) as stream:
+            speech_threshold = 10
+            speech_count = 0
+            speech = Audio(channels=Decoder.CHANNELS, width=2, rate=Decoder.SAMPLING_RATE)
+            try:
+                with async_timeout_pre.timeout(timeout) as timeout_cm:
+                    async for packet in stream:
+                        speech += packet
+                        logger_trace.debug(f"{self!r} speech packet: rms={packet.rms}")
+                        if packet.rms > 50:
+                            speech_count += 1
+                        actual_timeout = 0.4 if speech_count >= speech_threshold else timeout
+                        timeout_cm.shift_by(actual_timeout)
+            except asyncio.TimeoutError:
+                if not speech:
+                    logger.info(f"{self!r} speech was empty")
+                    raise EmptyUtterance
+            else:
+                logger.info(f"{self!r} listened speech: {speech.duration}s", extra=dict(speech=speech))
+                return speech
 
     @contextmanager
     def listening_utterance(self):
@@ -144,34 +180,19 @@ class VoiceUserContext:
         finally:
             self.input_queue = self.wuw_input
 
-    async def listen_audio_stream(self, timeout=2.3) -> AsyncGenerator[Audio, None]:
-        logger.info(f"{self!r} start listening utterance with timeout {timeout}")
+    async def listen_audio_stream(self) -> AsyncGenerator[Audio, None]:
+        logger.info(f"{self!r} start listening audio stream")
         async with background_task(self.play_loop(self.ticktock)):
-            sound = Audio(channels=Decoder.CHANNELS, width=2, rate=Decoder.SAMPLING_RATE)
-            speech_count = 0
-            speech_threshold = 10
             with self.listening_utterance() as queue:
                 while True:
-                    try:
-                        actual_timeout = 0.4 if speech_count >= speech_threshold else timeout
-                        packet = await asyncio.wait_for(queue.get(), timeout=actual_timeout)
-                        yield packet
-                        sound += packet
-                        logger.debug(f"{self!r} speech packet: rms={packet.rms}")
-                        if packet.rms > 50:
-                            speech_count += 1
-                    except asyncio.TimeoutError:
-                        if not sound:
-                            logger.info(f"{self!r} speech was empty")
-                            raise EmptyUtterance
-                        logger.info(f"{self!r} listened speech: {sound.duration}s", extra=dict(speech=sound))
-                        break
+                    yield await queue.get()
 
     async def listen_text(self, timeout=4, tries=1):
+        logger.info(f"{self!r} start text with {timeout=}")
         while True:
             try:
-                speech_stream = self.listen_audio_stream(timeout=timeout)
-                text = await speech_stream_to_text(speech_stream)
+                async with aclosing(self.listen_audio_stream()) as speech_stream:
+                    text = await listen_stream_until_got_text(speech_stream, timeout=timeout)
                 if not text:
                     raise EmptyUtterance
                 return text
@@ -184,7 +205,7 @@ class VoiceUserContext:
 
     async def feed(self, audio: Audio):
         self.input_queue.put_nowait(audio)
-        logger.debug(f'feed: {self!r}. qsize={self.input_queue.qsize()}')
+        logger_trace.debug(f'feed: {self!r}. qsize={self.input_queue.qsize()}')
 
     async def process_intent(self, text: str = None, speech: Audio = None, event: str = None, params: dict = None):
         intent = await detect_intent(self.user, text=text, speech=speech, event=event, params=params)

@@ -68,7 +68,8 @@ async def speech_to_text(speech: Audio):
 async def read_from_stream(stream):
     async for reply in stream:
         for chunk in reply.chunks:
-            logger.debug(f"STT: {'|'.join(alt.text for alt in chunk.alternatives)}. Final={chunk.final}")
+            log = logger.info if chunk.final else logger.debug
+            log(f"STT: {'|'.join(alt.text for alt in chunk.alternatives)}. Final={chunk.final}")
             yield chunk.alternatives
             if chunk.final:
                 return
