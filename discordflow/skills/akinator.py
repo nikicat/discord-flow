@@ -29,12 +29,16 @@ def parse_response(text):
     return resp['parameters']
 
 
+def get_url_api_ws():
+    return 'https://srv12.akinator.com:9398/ws'
+
+
 async def answer_api(sess: aiohttp.ClientSession, step: int, answer: int, session: int, signature: int, frontaddr: str):
     resp = await sess.get(
         'https://ru.akinator.com/answer_api',
         params=dict(
             callback='jquery',
-            urlApiWs='https://srv12.akinator.com:9340/ws',
+            urlApiWs=get_url_api_ws(),
             session=session,
             signature=signature,
             step=step,
@@ -51,7 +55,7 @@ async def new_session(sess, uid_ext_session, frontaddr):
         'https://ru.akinator.com/new_session',
         params=dict(
             callback='jquery',
-            urlApiWs='https://srv12.akinator.com:9340/ws',
+            urlApiWs=get_url_api_ws(),
             player='website-desktop',
             partner=1,
             uid_ext_session=uid_ext_session,
@@ -87,7 +91,7 @@ async def call_exclusion(sess, session, signature, step):
 
 async def call_api(sess, session, signature, step, api, **params):
     resp = await sess.get(
-        f'https://srv12.akinator.com:9340/ws/{api}',
+        f'{get_url_api_ws()}/{api}',
         params=dict(
             callback='jquery',
             session=session,
