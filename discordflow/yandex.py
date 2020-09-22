@@ -10,7 +10,7 @@ from grpclib.exceptions import ProtocolError
 from yandex.cloud.ai.stt.v2.stt_service_pb2 import RecognitionConfig, RecognitionSpec, StreamingRecognitionRequest
 from yandex.cloud.ai.stt.v2.stt_service_grpc import SttServiceStub
 
-from .utils import Audio, language, TooLongUtterance, background_task, EmptyUtterance
+from .utils import Audio, language, TooLongUtterance, background_task, EmptyUtterance, cancellable_stream
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,7 @@ async def write_to_stream(stream, speech_stream, sent):
             await stream.end()
 
 
+@cancellable_stream
 async def speech_stream_to_text(speech_stream):
     channel = Channel('stt.api.cloud.yandex.net', 443, ssl=True)
     try:

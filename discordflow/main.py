@@ -19,7 +19,7 @@ from . import yandex, google
 from .google import detect_intent, set_contexts
 from .utils import (
     BackgroundTask, Interrupted, Audio, registry, background_task, EmptyUtterance, rate_limit, size_limit, aiter, language,
-    TooLongUtterance, aclosing,
+    TooLongUtterance, AsyncTimedIterator, cancellable_stream,
 )
 from .skills import *  # noqa to load skills
 
@@ -49,31 +49,24 @@ async def text_to_speech(text: str):
         return await google.text_to_speech(text)
 
 
-async def speech_stream_to_text(speech_stream: AsyncGenerator[Audio, None]):
+async def listen_stream_until_got_text(speech_stream: AsyncGenerator[Audio, None], timeout: float):
     if language.get() == 'ru':
-        async for resp in yandex.speech_stream_to_text(speech_stream):
-            pass
-        return resp[0].text
+        async with yandex.speech_stream_to_text(speech_stream) as text_stream:
+            timed_text_stream = AsyncTimedIterator(text_stream, timeout, None)
+            async for resp in timed_text_stream:
+                if resp is None:
+                    await speech_stream.aclose()
+                    timed_text_stream.timeout = 5
+                else:
+                    timed_text_stream.timeout = 0.4
+            else:
+                if resp:
+                    return resp[0].text
+                else:
+                    raise EmptyUtterance
     else:
         # TODO: implement Google streaming STT
         return await google.speech_to_text(accumulate(packet async for packet in speech_stream))
-
-
-async def listen_stream_until_got_text(speech_stream: AsyncGenerator[Audio, None], timeout: float):
-    if language.get() == 'ru':
-        try:
-            resp = None
-            async with aclosing(yandex.speech_stream_to_text(speech_stream)) as text_stream:
-                async with async_timeout_pre.timeout(timeout) as timeout_cm:
-                    async for resp in text_stream:
-                        timeout_cm.shift_by(0.4)
-        except asyncio.TimeoutError as exc:
-            if resp:
-                return resp[0].text
-            else:
-                raise EmptyUtterance from exc
-    else:
-        raise NotImplementedError
 
 
 class VoiceUserContext:
@@ -151,7 +144,7 @@ class VoiceUserContext:
 
     async def listen_audio(self, timeout=2.3) -> Audio:
         logger.info(f"{self!r} start listening audio with timeout {timeout}")
-        async with aclosing(self.listen_audio_stream()) as stream:
+        async with self.listen_audio_stream() as stream:
             speech_threshold = 10
             speech_count = 0
             speech = Audio(channels=Decoder.CHANNELS, width=2, rate=Decoder.SAMPLING_RATE)
@@ -180,6 +173,7 @@ class VoiceUserContext:
         finally:
             self.input_queue = self.wuw_input
 
+    @cancellable_stream
     async def listen_audio_stream(self) -> AsyncGenerator[Audio, None]:
         logger.info(f"{self!r} start listening audio stream")
         async with background_task(self.play_loop(self.ticktock)):
@@ -191,7 +185,7 @@ class VoiceUserContext:
         logger.info(f"{self!r} start text with {timeout=}")
         while True:
             try:
-                async with aclosing(self.listen_audio_stream()) as speech_stream:
+                async with self.listen_audio_stream() as speech_stream:
                     text = await listen_stream_until_got_text(speech_stream, timeout=timeout)
                 if not text:
                     raise EmptyUtterance
@@ -504,7 +498,8 @@ class DialogflowCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, user, old_state, new_state):
-        if user != self.bot.user and old_state.channel is None and new_state.channel is not None:
+        bot_channels = [vc.channel for vc in self.bot.voice_clients]
+        if user != self.bot.user and old_state.channel is not new_state.channel and new_state.channel in bot_channels:
             await asyncio.sleep(0.4)  # Wait while user voice connection is established
             await self.voice_bots[new_state.channel.guild].on_welcome(user)
 

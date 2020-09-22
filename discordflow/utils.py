@@ -9,7 +9,7 @@ import wave
 from contextlib import suppress, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 
 import simpleaudio
 
@@ -289,3 +289,71 @@ async def aclosing(generator):
         yield generator
     finally:
         await generator.aclose()
+
+
+class AsyncTimedIterator:
+    def __init__(self, iterable, timeout, sentinel):
+        self._iterable = iterable
+        self.timeout = timeout
+        self._sentinel = sentinel
+        self.task = None
+
+    def __aiter__(self):
+        self._iterator = self._iterable.__aiter__()
+        return self
+
+    async def __anext__(self):
+        task = self.task or asyncio.create_task(self._iterator.__anext__())
+        self.task = None
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), self.timeout)
+        except asyncio.TimeoutError:
+            self.task = task
+            return self._sentinel
+
+
+class CancellableAsyncGenerator:
+    def __init__(self, gen):
+        self.gen = gen
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, cb):
+        await self.aclose()
+
+    def __aiter__(self):
+        return self
+
+    async def aclose(self):
+        logger.debug("aclose gen")
+        if self.gen is None:
+            return
+        task = self.task or asyncio.create_task(self.gen.__anext__())
+        self.task = None
+        task.cancel()
+        self.gen = None
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def __anext__(self):
+        if self.gen:
+            self.task = asyncio.create_task(self.gen.__anext__())
+            try:
+                return await self.task
+            except asyncio.CancelledError:
+                if self.gen is None:
+                    raise StopAsyncIteration
+                else:
+                    raise
+            finally:
+                self.task = None
+        else:
+            raise StopAsyncIteration
+
+
+def cancellable_stream(afunc):
+    @wraps(afunc)
+    def wrapper(*args, **kwargs):
+        return CancellableAsyncGenerator(afunc(*args, **kwargs))
+    return wrapper
