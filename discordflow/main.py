@@ -9,7 +9,7 @@ from typing import List, AsyncGenerator, Dict
 
 import async_timeout_pre
 import discord.utils
-from discord import File, SpeakingState, VoiceClient, TextChannel, Guild, User
+from discord import File, SpeakingState, VoiceClient, TextChannel, Guild, User, Member, Client
 from discord.ext import commands
 from discord.opus import Decoder, Encoder, _load_default
 from discord.reader import AudioSink, AudioReader
@@ -73,6 +73,7 @@ class VoiceUserContext:
     def __init__(self, parent, keywords, user):
         self.parent = parent
         self.user = user
+        self.channel = parent.client.channel
         self.pcp = create(keywords=keywords, sensitivities=[0.5] * len(keywords))
         self.unpacker = Struct(f'{self.pcp.frame_length}h')
         self.welcome_response = None
@@ -283,16 +284,21 @@ class VoiceUserContext:
 
 
 class TextUserContext:
-    def __init__(self, channel: TextChannel, user):
-        self.channel = channel
-        self.user = user
+    def __init__(self, ctx: commands.context.Context):
+        self.channel: TextChannel = ctx.channel
+        self.user: Member = ctx.author
+        self.bot: Client = ctx.bot
 
     async def say(self, text: str):
         await self.channel.send(text)
 
-    async def ask(self, text: str) -> str:
+    def check(self, m):
+        return m.channel == self.channel and m.author == self.user
+
+    async def ask(self, text: str, timeout: float = None) -> str:
         await self.say(text)
-        await self.client.wait_for('message', lambda m: m.channel == self.channel and m.author == self.user)
+        message = await self.bot.wait_for('message', check=self.check)
+        return message.content
 
 
 class ChannelVoiceContext(AudioSink):
@@ -420,7 +426,7 @@ class DialogflowCog(commands.Cog):
     def get_text_context(self, ctx):
         key = (ctx.channel, ctx.author)
         if key not in self.text_contexts:
-            self.text_contexts[key] = TextUserContext(ctx.channel, ctx.author)
+            self.text_contexts[key] = TextUserContext(ctx)
         return self.text_contexts[key]
 
     @commands.command()
@@ -439,6 +445,11 @@ class DialogflowCog(commands.Cog):
     async def parlai(self, ctx, initial: str = None):
         skill_ctx = self.get_text_context(ctx)
         await registry.run_skill('parlai', skill_ctx, initial)
+
+    @commands.command()
+    async def aidungeon(self, ctx, initial: str = None):
+        skill_ctx = self.get_text_context(ctx)
+        await registry.run_skill('aidungeon', skill_ctx, initial)
 
     @commands.command()
     async def search(self, ctx, query):

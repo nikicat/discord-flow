@@ -2,16 +2,16 @@ import asyncio
 import audioop
 import io
 import logging
-import pickle
 import time
 import unicodedata
 import wave
-from contextlib import suppress, asynccontextmanager
+from contextlib import suppress, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial, wraps
 
 import simpleaudio
+import yaml
 
 logger = logging.getLogger(__name__)
 language = ContextVar('language', default='ru')
@@ -198,6 +198,32 @@ class Audio:
             play.stop()
 
 
+class UserState:
+    __slots__ = ['values', 'filepath']
+
+    def __init__(self, skill, ctx):
+        self.values = {}
+        self.filepath = f'skill-states/{skill}.{ctx.channel.id}.{ctx.user.name}.yaml'
+
+    def __setattr__(self, name, value):
+        if name in self.__slots__:
+            super().__setattr__(name, value)
+        else:
+            self.values[name] = value
+            self.save()
+
+    def __getattr__(self, name):
+        return self.values.get(name)
+
+    def load(self):
+        with open(self.filepath, 'r') as f:
+            self.values = yaml.load(f)
+
+    def save(self):
+        with open(self.filepath, 'w') as f:
+            return yaml.dump(self.values, f)
+
+
 class Registry:
     def __init__(self):
         self.skills = {}
@@ -226,27 +252,22 @@ class Registry:
         if skill in self.skills:
             if skill in self.initializers:
                 self.initialize(skill)
-            try:
-                state = self.load_state(skill, ctx)
-            except Exception as exc:
-                logger.debug(f"Cant load state for {skill}.{ctx} due to {exc}")
-                state = None
-            state = await self.skills[skill](ctx, state, *args, **kwargs)
-            if state:
-                self.save_state(skill, ctx, state)
+            with self.acquire_state(skill, ctx) as state:
+                await self.skills[skill](ctx, state, *args, **kwargs)
         else:
             await ctx.say("такого я не умею")
 
-    def get_state_path(self, skill: str, ctx):
-        return f'skill-states/{skill}.{ctx.channel.id}.{ctx.user.name}.pickle'
-
-    def load_state(self, skill: str, ctx):
-        with open(self.get_state_path(skill, ctx), 'rb') as f:
-            return pickle.load(f)
-
-    def save_state(self, skill: str, ctx, state):
-        with open(self.get_state_path(skill, ctx), 'wb') as f:
-            return pickle.dump(state, f)
+    @contextmanager
+    def acquire_state(self, skill: str, ctx):
+        state = UserState(skill, ctx)
+        try:
+            state.load()
+        except Exception as exc:
+            logger.debug(f"Cant load state for {skill}.{ctx} due to {exc}")
+        try:
+            yield state
+        finally:
+            state.save()
 
 
 registry = Registry()
