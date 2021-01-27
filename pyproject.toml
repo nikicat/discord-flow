@@ -8,7 +8,7 @@ authors = ["Nikolay Bryskin <nb@gosu.ai>"]
 python = "^3.8"
 google-auth = {git = "https://github.com/tan01/google-auth-library-python", rev = "user/tan01/feature/asyncio_aiohttp_support"}
 subword-nmt = {git = "https://github.com/rsennrich/subword-nmt"}
-"discord.py" = {path = "../discord.py"}
+"discord.py" = {git = "https://github.com/nikicat/discord.py", branch = "voice-recv-nb"}
 aiohttp = ">=3.0.0"
 websockets = "^8.1"
 youtube-dl = "^2020.6.16"
@@ -19,7 +19,6 @@ parlai = "^0.1.20200610"
 coloredlogs = "^14.0"
 grpclib = "^0.4.0"
 protobuf = "^3.12.2"
-aidungeon = {path = "../aidungeon"}
 async-timeout-pre = {git = "https://github.com/nikicat/async-timeout"}
 
 [tool.poetry.dev-dependencies]
